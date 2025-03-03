@@ -11,8 +11,7 @@ enum class GemmType {
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
 template <GemmType kGemmType,
-          uint32_t SHAPE_N, uint32_t BLOCK_M, uint32_t BLOCK_N,
-          uint32_t kNumGroups, uint32_t kNumTMAMulticast,
+          uint32_t SHAPE_N, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumGroups,
           uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N),
           uint32_t kNumNBlocksPerGroup = 16>
 struct Scheduler {
@@ -27,9 +26,13 @@ struct Scheduler {
     int* grouped_layout;
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum;
+    // with hybrid cluster sizes, we can't use blockIdx.x/gridDim.x directly
+    // e.g. with 15 clusters of 8 + 4 clusters of 2, latter will have: block_idx = 120+blockIdx.x
+    int block_idx, grid_size;
 
     __device__ __forceinline__ explicit Scheduler(const uint32_t shape_m,
-                                                  int* grouped_layout = nullptr) {
+                                                  int* grouped_layout = nullptr,
+                                                  int block_idx = -1, int grid_size = -1) {
         num_aligned_m_blocks = ceil_div(shape_m, BLOCK_M);
         if constexpr (kGemmType == GemmType::Normal) {
             num_blocks = num_aligned_m_blocks * kNumNBlocks;
@@ -40,10 +43,13 @@ struct Scheduler {
             curr_group_idx = curr_cumsum = 0;
             this->grouped_layout = grouped_layout;
         }
+        this->block_idx = block_idx >= 0 ? block_idx : blockIdx.x;
+        this->grid_size = grid_size >= 0 ? grid_size : gridDim.x;
     }
 
     __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        DG_STATIC_ASSERT(kNumNBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
+        // TODO: check for this statically host side (since cluster size is now dynamic)
+        //DG_STATIC_ASSERT(kNumNBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
         // Swizzle for better L2 usages
         auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup;
@@ -69,7 +75,7 @@ struct Scheduler {
     }
 
     __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        const auto next_block_idx = (++ current_iter) * gridDim.x + blockIdx.x;
+        const auto next_block_idx = (++ current_iter) * grid_size + block_idx;
 
         if constexpr (kGemmType == GemmType::GroupedMasked) {
             uint32_t num_m_blocks;

@@ -46,3 +46,14 @@ template <typename T>
 __device__ __host__ constexpr T ceil_div(T a, T b) {
     return (a + b - 1) / b;
 }
+
+__device__ void elect_or_exit() {
+    // this helps the compiler not be silly (tested on 12.8)
+    // threadIdx.x == constant should be enough but it isn't... :(
+    asm volatile (
+        "{\n\t"
+         ".reg .pred P;\n\t"
+         "elect.sync _|P, 0xFFFFFFFF;\n\t"
+         "@!P exit;\n\t"
+        "}\n" :: );
+}

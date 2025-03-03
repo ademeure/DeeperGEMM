@@ -4,7 +4,7 @@ import torch
 from typing import Any, Dict
 
 from ..jit import build, cpp_format, generate, Runtime
-
+from .utils import ceil_div
 
 class JITTuner:
     def __init__(self) -> None:
@@ -24,6 +24,20 @@ class JITTuner:
 
         if os.getenv('DG_JIT_DEBUG', None):
             print(f'Auto-tuning JIT kernel {name} with keys {keys}')
+
+        # TODO: dynamic/automatic tuning of unroll factor
+        # TODO: manual unrolling by using template.py to copy the code multiple times?
+        # TODO: handle tail better, because BLOCK_K=8192 means 31 iterations which is prime :(
+        if not "NUM_UNROLL" in keys:
+            # Find largest divisor of loop iteration count that's no greater than max_unroll
+            max_unroll = 15 
+            loop_iterations = ceil_div(keys["K"], 256) - 1 # 1 per 2 BLOCK_K
+            num_unroll = min(loop_iterations, max_unroll)
+            while loop_iterations % num_unroll != 0:
+                num_unroll -= 1
+            if (loop_iterations >= 16 and num_unroll <= 4):
+                num_unroll = 8
+            keys["NUM_UNROLL"] = num_unroll
 
         assert signature not in self.tuned
         assert args is not None

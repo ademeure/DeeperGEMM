@@ -77,9 +77,19 @@ class suppress_stdout_stderr:
 
 
 def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: bool = False,
-                 trace_path: str = None, barrier_comm_profiling: bool = False, flush_l2: bool = False):
+                 trace_path: str = None, barrier_comm_profiling: bool = False, flush_l2: bool = True):
     # Conflict with Nsight Systems
     using_nsys = os.environ.get('DG_NSYS_PROFILING', False)
+    
+    # By default, flush L2 with an excessively long 8GiB memset to give the GPU some half-idle time
+    # this allows it to cool down a bit and hopefully avoid thermal throttling without an actual wait
+    # TODO: is this actually better than a wait in practice?
+    flush_l2_size = int(8192e6 // 4)
+    if os.environ.get('DG_BENCH_POWER_LIMITED', False):
+        # if we want to be thermally limited, we need to run many iterations over a fairly long time
+        # and spend as little time doing memset or any other setup work (100MiB should be enough)
+        flush_l2_size = int(100e6 // 4)
+        num_tests = 2000
 
     # For some auto-tuning kernels with prints
     fn()
@@ -99,7 +109,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
                     dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
                 for _ in range(num_tests):
                     if flush_l2:
-                        torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda').zero_()
+                        torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
                     fn()
 
                 if not using_nsys:

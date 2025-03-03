@@ -14,10 +14,11 @@ constexpr auto N = {N}, K = {K};
 constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto kNumStages = {NUM_STAGES};
+constexpr auto kNumUnroll = {NUM_UNROLL};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
 
 // Make a templated GEMM
-using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
+using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumUnroll, kNumTMAMulticast, GemmType::Normal>;
 
 // Launch kernel
 auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
@@ -42,11 +43,13 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
     smem_a_per_stage = block_m * block_k
     smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
-    smem_scales_b = ceil_div(k, block_k) * 4
-    smem_barrier = num_stages * 8 * 2
+    smem_scales_b = ceil_div(k, block_k) * 4 * 2
+    smem_barrier = (num_stages + 2) * 8 * 2
 
     smem_size = 0
-    smem_size += smem_d
+    # we reuse one stage of A+B to store D instead of dedicated storage
+    # smem_size += smem_d
+    assert smem_d <= (smem_a_per_stage + smem_b_per_stage)
     smem_size += num_stages * smem_a_per_stage
     smem_size += num_stages * smem_scales_a_per_stage
     smem_size += num_stages * smem_b_per_stage
@@ -89,7 +92,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_size, sm90_capacity = None, None, 232448
-    for num_stages in (6, 5, 4) if 128 % best_block_n != 0 else (8, 7, 6, 5, 4):
+    for num_stages in (8,7, 6, 5, 4) if 128 % best_block_n != 0 else (10, 9, 8, 7, 6, 5, 4):
         best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n)
         if best_smem_size <= sm90_capacity:
             best_num_stages = num_stages
@@ -98,7 +101,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # Decide the number of TMA multicast
     best_num_tma_multicast = 1
-    if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
+    if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and (num_groups == 1 or is_grouped_contiguous):
         best_num_tma_multicast = 2
 
     return best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
