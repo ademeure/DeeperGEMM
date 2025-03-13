@@ -48,7 +48,7 @@ def get_m_alignment_for_contiguous_layout():
     When we do a grouped GEMM in contiguous format, LHS are grouped into several batches along the M axis.
     Since we deal with exactly one sub-matrix of RHS for each GEMM block, batch sizes above should align well
         with GEMM block shape.
-    
+
     Returns:
         Group-level alignment requirement for grouped contiguous layout, which is always 128.
     """
@@ -89,11 +89,15 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     # NOTES: for the extreme performance, you may rewrite/fuse this function in CUDA
     assert x.dim() in (2, 3)
     remove_dim = False
+
+    aligned_m = get_tma_aligned_size(x.shape[x.dim()-2], x.element_size())
     if x.dim() == 2:
-        x, remove_dim = x.unsqueeze(0), True
+        if x.stride(0) == 1 and x.stride(1) == aligned_m:
+            return x # fast path when already transposed (previously resulted in a memcpy)
+        else:
+            x, remove_dim = x.unsqueeze(0), True
 
     b, m, n = x.shape
-    aligned_m = get_tma_aligned_size(m, x.element_size())
 
     # The last kernel gives a column-major TMA aligned layout
     if x.stride(0) == aligned_m * n and x.stride(1) == 1 and x.stride(2) == aligned_m:

@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import torch
 import torch.distributed as dist
 
@@ -81,20 +82,23 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
     # Conflict with Nsight Systems
     using_nsys = os.environ.get('DG_NSYS_PROFILING', False)
 
-    # By default, flush L2 with an excessively long 8GiB memset to give the GPU some half-idle time
-    # this allows it to cool down a bit and hopefully avoid thermal throttling without an actual wait
-    # TODO: is this actually better than a wait in practice? more realistic ("light kernels") at least
+    # By default, flush L2 with an excessive 8GB memset to give the GPU some (literal) chill time without full idle
+    # this avoid thermal throttling while keeping DVFS at maximum clocks (slight perf gain vs sleep / more consistent)
     sleep_between_tests = 0.0
-    flush_l2_size = int(8192e6 // 4)
+    flush_l2_size = int(8e9 // 4)
     if os.environ.get('DG_BENCH_DISABLE_L2_FLUSH', False):
         flush_l2 = False
     if os.environ.get('DG_BENCH_POWER_LIMITED', False):
-        # if we want to be thermally limited, we need to run many iterations over a fairly long time
-        # and spend as little time doing memset or any other setup work (100MiB should be enough)
-        flush_l2_size = int(100e6 // 4)
+        # if we want to be thermally limited, we need to run many iterations non-stop for a fairly long time
+        # and spend as little time as possible doing memset and other setup work (80MiB should be enough to flush L2)
         num_tests = 2000
-    if os.environ.get('DG_BENCH_SLEEP_BETWEEN_TESTS', False):
-        sleep_between_tests = 0.025
+        flush_l2_size = int(80e6 // 4)
+    sleep_val = os.environ.get('DG_BENCH_SLEEP_BETWEEN_TESTS', False)
+    if sleep_val:
+        try:
+            sleep_between_tests = float(sleep_val)
+        except ValueError:
+            pass  # Keep default
 
     # For some auto-tuning kernels with prints
     fn()
@@ -113,10 +117,10 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
                     lhs @ rhs
                     dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
                 for _ in range(num_tests):
+                    if sleep_between_tests > 0.0:
+                        time.sleep(sleep_between_tests)
                     if flush_l2:
                         torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
-                    if sleep_between_tests > 0:
-                        time.sleep(sleep_between_tests)
                     fn()
 
                 if not using_nsys:
