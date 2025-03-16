@@ -33,9 +33,15 @@ def construct(m: int, k: int, n: int) -> \
     ref_out = x @ y.t()
 
     x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
+
+    # If L2 side optimization
+    y_fp8_reordered = torch.empty_like(y_fp8[0])
+    deep_gemm.preprocess_reorder_b(y_fp8[0], y_fp8_reordered)
+    y_fp8_output = (y_fp8_reordered, y_fp8[1])
+
     # Transpose earlier so that the testing will not trigger transposing kernels
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
-    return x_fp8, y_fp8, out, ref_out
+    return x_fp8, y_fp8_output, out, ref_out
 
 
 def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) -> \
@@ -52,6 +58,11 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
         x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
         y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
 
+    # If L2 side optimization
+    y_fp8_0_reordered = torch.empty_like(y_fp8[0])
+    deep_gemm.preprocess_reorder_b_grouped(y_fp8[0], y_fp8_0_reordered, is_masked)
+    y_fp8_output = (y_fp8_0_reordered, y_fp8[1])
+
     # For non-masked input, we must merge the group and M dims
     if not is_masked:
         x_fp8 = (x_fp8[0].view(-1, k), per_token_cast_to_fp8(x.view(-1, k))[1])
@@ -59,7 +70,7 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
 
     # Transpose earlier so that the testing will not trigger transposing kernels
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
-    return x_fp8, y_fp8, out, ref_out
+    return x_fp8, y_fp8_output, out, ref_out
 
 
 def test_gemm() -> None:
