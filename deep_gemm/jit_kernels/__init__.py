@@ -8,3 +8,7 @@ from .utils import (
     get_col_major_tma_aligned_tensor,
     get_m_alignment_for_contiguous_layout
 )
+from .preprocess import (
+    preprocess_reorder_b,
+    preprocess_reorder_b_grouped
+)

@@ -12,8 +12,10 @@ enum class GemmType {
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
 template <GemmType kGemmType,
           uint32_t SHAPE_N, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumGroups,
-          uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N),
-          uint32_t kNumNBlocksPerGroup = 16>
+          // TODO: halved because of L2 side awareness effectively doubling Ns in parallel
+          // but this should probably be auto-tuned instead...
+          uint32_t kNumNBlocksPerGroup = 8,
+          uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N)>
 struct Scheduler {
     int current_iter = -1;
     uint32_t num_aligned_m_blocks;
@@ -29,10 +31,11 @@ struct Scheduler {
     // with hybrid cluster sizes, we can't use blockIdx.x/gridDim.x directly
     // e.g. with 15 clusters of 8 + 4 clusters of 2, latter will have: block_idx = 120+blockIdx.x
     int block_idx, grid_size;
-
+    int n_block_offset;
     __device__ __forceinline__ explicit Scheduler(const uint32_t shape_m,
                                                   int* grouped_layout = nullptr,
-                                                  int block_idx = -1, int grid_size = -1) {
+                                                  int block_idx = -1, int grid_size = -1,
+                                                  int n_block_offset = 0) {
         num_aligned_m_blocks = ceil_div(shape_m, BLOCK_M);
         if constexpr (kGemmType == GemmType::Normal) {
             num_blocks = num_aligned_m_blocks * kNumNBlocks;
@@ -45,6 +48,7 @@ struct Scheduler {
         }
         this->block_idx = block_idx >= 0 ? block_idx : blockIdx.x;
         this->grid_size = grid_size >= 0 ? grid_size : gridDim.x;
+        this->n_block_offset = n_block_offset;
     }
 
     __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
@@ -52,7 +56,7 @@ struct Scheduler {
         //DG_STATIC_ASSERT(kNumNBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
         // Swizzle for better L2 usages
-        auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup;
+        auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup; // HACK: TODO: temporary optimization for m=64
         auto group_idx = block_idx / num_blocks_per_group;
         auto first_n_block_idx = group_idx * kNumNBlocksPerGroup;
         auto num_n_blocks_in_group = min(kNumNBlocksPerGroup, kNumNBlocks - first_n_block_idx);
@@ -81,8 +85,10 @@ struct Scheduler {
             uint32_t num_m_blocks;
             while (true) {
                 // End of the task
-                if (curr_group_idx == kNumGroups)
+                if (curr_group_idx == kNumGroups) {
+                    m_block_idx = 0xFFFFFFFF;
                     return false;
+                }
 
                 // Within current group
                 num_m_blocks = ceil_div(static_cast<uint32_t>(__ldg(grouped_layout + curr_group_idx)), BLOCK_M);
@@ -96,11 +102,14 @@ struct Scheduler {
 
             get_swizzled_block_idx(num_m_blocks, next_block_idx - curr_cumsum * kNumNBlocks, m_block_idx, n_block_idx);
         } else {
-            if (next_block_idx >= num_blocks)
+            if (next_block_idx >= num_blocks) {
+                m_block_idx = 0xFFFFFFFF;
                 return false;
+            }
 
             get_swizzled_block_idx(num_aligned_m_blocks, next_block_idx, m_block_idx, n_block_idx);
         }
+        n_block_idx += n_block_offset;
         return true;
     }
 };

@@ -28,10 +28,11 @@ class JITTuner:
         # TODO: dynamic/automatic tuning of unroll factor
         # TODO: manual unrolling by using template.py to copy the code multiple times?
         # TODO: handle tail better, because BLOCK_K=8192 means 31 iterations which is prime :(
-        if not "NUM_UNROLL" in keys:
+        # TODO: rewrite all this to be helpful with DOUBLE_PUMP mode (and/or copy-paste instead of unroll)
+        if not "NUM_UNROLL" in keys and "K" in keys:
             # Find largest divisor of loop iteration count that's no greater than max_unroll
-            max_unroll = 15 
-            loop_iterations = ceil_div(keys["K"], 256) - 1 # 1 per 2 BLOCK_K
+            max_unroll = 15
+            loop_iterations = max(1, ceil_div(keys["K"], 256) - 1) # 1 per 2 BLOCK_K
             num_unroll = min(loop_iterations, max_unroll)
             while loop_iterations % num_unroll != 0:
                 num_unroll -= 1

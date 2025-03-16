@@ -26,9 +26,10 @@ auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
 auto tma_b_desc = GemmType::make_2d_tma_b_desc(rhs);
 auto tma_scales_a_desc = GemmType::make_2d_tma_scales_a_desc(lhs_scales, m);
 auto tma_d_desc = GemmType::make_2d_tma_d_desc(out, m);
-GemmType::run(out, rhs_scales, grouped_layout,
+auto tma_d_padded_desc = GemmType::make_3d_tma_d_desc(out, m);
+GemmType::run(out, rhs, rhs_scales, grouped_layout,
               m,
-              tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
+              tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc, tma_d_padded_desc,
               stream, num_sms, smem_size);
 """
 
