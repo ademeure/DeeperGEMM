@@ -1,3 +1,7 @@
+UPDATE: I'm planning to release an updated & bugfixed version in a few days with a custom PyTorch memory allocator that will significantly reduce the overhead of "L2 side awareness" and provide a simple way to create L2 aware elementwise 1:1 kernels.
+
+I'll also write explanations of the existing optimisations, feel free to let me know if you have any thoughts or things that don't make sense!
+
 # DeeperGEMM
 
 Deepseek’s DeepGEMM delivers great FP8 matrix multiplication performance with fine-grained scaling on NVIDIA Hopper GPUs using custom PTX, something that seemed nearly impossible previously given the lack of hardware support for micro-tensor scaling (added in Blackwell).
