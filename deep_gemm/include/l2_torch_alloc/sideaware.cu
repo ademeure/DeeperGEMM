@@ -1,17 +1,19 @@
 // ============================================================================
-// "L2 Side Aware" memory allocation & elementwise kernels in a single CUDA file
+// "CUDA L2 Side Boost" memory allocation & elementwise kernels in a single file
 // ============================================================================
 // - World's most efficient Hopper & Blackwell memcpy and elementwise kernels (>10% lower power)
 // - PyTorch Pluggable Allocator support (+easy interface for any CUDA project)
-// - Easy custom kernels with NVRTC recompilation
-// - Up to 4 inputs and 4 outputs of any size
-// - L2 hints, discard, compression, etc...
+// - Easy custom kernels with NVRTC recompilation (cached in CUDA 12.9+)
+// - Up to 4 inputs and 4 outputs of any size (mixed sizes allowed)
+// - Flexible indexing & more for RoPE, FP8 micro-scaling, etc.
+// - L2 hints, discard, compression, and much more...
 // ============================================================================
 // Example build & test commands:
-//   nvcc -arch=native -Xcompiler -fPIC -shared sideaware.cu -o sideaware.so -lcuda -lnvrtc && python test.py
+// nvcc -arch=native -Xcompiler -fPIC -shared sideaware.cu -o sideaware.so -lcuda -lnvrtc
+// python test.py
 // ============================================================================
-// Also see sideaware_alloc.cu & sideaware_memcpy.cu (subset without PyTorch/NVRTC/etc.)
-// https://github.com/ademeure/l2_torch_alloc
+// Also see sideaware_alloc.cuh & kernel_memcpy.cuh (subset without PyTorch/NVRTC)
+// https://github.com/ademeure/cuda_side_boost
 // ============================================================================
 #include <cassert>
 #include <cstring>
@@ -32,24 +34,17 @@ static const char* SIDEAWARE_MEMCPY_HEADER = R"SIDEAWARE_MEMCPY(
 typedef int o0;
 typedef int i0;
 
-struct unused {}; // optimized away by compiler
+struct unused {};
 typedef unused o1, o2, o3, i1, i2, i3;
 
-__device__ void elementwise_op(size_t element_idx,
-                               o0 &out0, o1 &out1,
-                               o2 &out2, o3 &out3,
-                               const i0 &in0, const i1 &in1,
-                               const i2 &in2, const i3 &in3) {
+constexpr bool reverse_order = false; // process end of array 1st (maximise L2 hits with normal->reverse->normal->...)
+constexpr bool input_evict[4] = {1,0,0,0}; // do not keep inputs in L2 (more space for outputs)
+
+__device__ void elementwise_op(size_t element_idx, int sideband,
+                               o0 &out0, o1 &out1, o2 &out2, o3 &out3,
+                               const i0 &in0, const i1 &in1, const i2 &in2, const i3 &in3) {
     out0 = in0;
 }
-
-constexpr int unrolled = 4; // unrolled loop iterations (increases register pressure especially with multiple inputs)
-constexpr bool reverse_order = true; // process end of array 1st (maximise L2 hits with normal->reverse->normal->...)
-constexpr bool input_evict[4] = {true, true, true, true}; // do not keep inputs in L2 (more space for outputs)
-
-constexpr bool support_concurrent_kernels = false; // use atomics to dynamically assign SM side index
-constexpr bool input_discard[4] = {0}; // danger: discards from L2 *before* data is written to DRAM
-
 )SIDEAWARE_MEMCPY";
 
 static const char* SIDEAWARE_KERNEL_SOURCE = R"SIDEAWARE_KERNEL(
@@ -62,9 +57,16 @@ static const char* SIDEAWARE_KERNEL_SOURCE = R"SIDEAWARE_KERNEL(
 
 #define KERNEL_NAME sideaware_elementwise
 
-#ifndef LAUNCH_BOUNDS
-#define LAUNCH_BOUNDS __launch_bounds__(1024, 1)
+#ifndef UNROLLED
+#define UNROLLED 4 // unrolled loop iterations (increases register pressure especially with multiple inputs)
 #endif
+#ifndef LAUNCH_BOUNDS
+#define LAUNCH_BOUNDS __launch_bounds__(1024, 1) // (1024,1) ==>> compiler must use less than 64 registers
+#endif
+#ifndef DISCARD_INPUTS
+constexpr bool input_discard[4] = {0,0,0,0}; // danger: discards from L2 *before* data is written to DRAM
+#endif
+
 #ifndef FORCE_WRONG_SIDE
 #define FORCE_WRONG_SIDE false
 #endif
@@ -72,18 +74,37 @@ static const char* SIDEAWARE_KERNEL_SOURCE = R"SIDEAWARE_KERNEL(
 #define FORCE_RANDOM_SIDE false
 #endif
 
+//#define DYNAMIC_INDEX_FOR_CONCURRENT_KERNELS // use atomics to dynamically assign SM side index
+//#define CUSTOM_VECTOR_OP // custom vector_op() instead of elementwise_op()
+//#define CUSTOM_IDX_FUNC
+
 // Typically only need custom elementwise_op, but support custom vector_op if needed
 // e.g. for BF16 -> MXFP8 with microscaling where we need the absmax over 32 elements
 // (in theory, we have access to 512 bytes per warp and 4096 bytes per group with barriers)
 #ifndef CUSTOM_VECTOR_OP
-template<typename size_type>
-__device__ void vector_op(size_type idx, int vec_size,
+__device__ void vector_op(size_type vec_idx, int vec_size,
                           o0 *out0, o1 *out1, o2 *out2, o3 *out3,
                           const i0 *in0, const i1 *in1, const i2 *in2, const i3 *in3,
                           int* sideband_memory, int sideband_value) {
     for (int i = 0; i < vec_size; i++) {
-        elementwise_op(idx * vec_size + i, out0[i], out1[i], out2[i], out3[i], in0[i], in1[i], in2[i], in3[i]);
+        elementwise_op(vec_idx * vec_size + i, sideband_value,
+                       out0[i], out1[i], out2[i], out3[i],
+                       in0[i], in1[i], in2[i], in3[i]);
     }
+}
+#endif
+
+// This allows complex indexing (not 1:1) as long it can be determinally statically
+// e.g. RoPE will have a dynamic non-linear index for i1 based on vec_idx/vec_size only
+#ifndef CUSTOM_IDX_FUNC
+__device__ bool indexing(size_type vec_idx, int vec_size,
+                         size_type &idx_i0, size_type &idx_i1, size_type &idx_i2, size_type &idx_i3,
+                         int* sideband_memory, int sideband_value) {
+    idx_i0 = vec_idx;
+    idx_i1 = vec_idx;
+    idx_i2 = vec_idx;
+    idx_i3 = vec_idx;
+    return false; // do not skip
 }
 #endif
 
@@ -135,7 +156,7 @@ __device__ __forceinline__ T load(const T * __restrict__ src) {
 }
 
 // Automatically use vector stores (assumes pointer is aligned, otherwise it's an illegal memory access)
-template<bool evict = false, typename T>
+template<bool writeback = true, typename T> // TODO: cache streaming support for outputs
 __device__ __forceinline__ void store(T* __restrict__ ptr, const T &value) {
     T* aligned_ptr = (T*)__builtin_assume_aligned(ptr, sizeof(T));
     aligned_ptr[0] = value;
@@ -187,37 +208,35 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
     unsigned int sm_side = params.side_index[smid] & 1;
     unsigned int sm_side_index;
 
-    if constexpr (support_concurrent_kernels == false) {
-        // Static side index (determined at init time at the same time as detecting the side of each SM)
-        // Only works if all SMs are available and gridDim == SM count, otherwise some data might be skipped
-        sm_side_index = params.side_index[smid] >> 1;
+    // Static side index (determined at init time at the same time as detecting the side of each SM)
+    // Only works if all SMs are available and gridDim == SM count, otherwise some data might be skipped
+    sm_side_index = params.side_index[smid] >> 1;
+
+    #ifdef DYNAMIC_INDEX_FOR_CONCURRENT_KERNELS
+    // Dynamic side index using atomics (always works and only significantly slower when static would fail)
+    __shared__ unsigned int shared_sm_side_index;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
         if (sm_side_index >= num_sm_per_side) {
-            return;
-        }
-    } else {
-        // Dynamic side index using atomics (always works)
-        __shared__ unsigned int shared_sm_side_index;
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            sm_side = 1 - sm_side; // need to process the 'wrong side' or no one will (slower but safer)
             sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
-            if (sm_side_index >= num_sm_per_side) {
-                sm_side = 1 - sm_side; // need to process the 'wrong side' or no one will (slower but safer)
-                sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
-            }
-            unsigned int total_both_sides = atomicInc(&zeroed_scratch_buffer[2], 999);
-            if (total_both_sides >= gridDim.x - 1) {
-                // Reset the counter for the next kernel launch
-                // (cycle through multiple buffers to support kernels running in parallel)
-                zeroed_scratch_buffer[0] = 0;
-                zeroed_scratch_buffer[1] = 0;
-                zeroed_scratch_buffer[2] = 0;
-            }
-            shared_sm_side_index = sm_side_index;
         }
-        __syncthreads();
-        sm_side_index = shared_sm_side_index;
-        if (sm_side_index >= num_sm_per_side) {
-            return;
+        unsigned int total_both_sides = atomicInc(&zeroed_scratch_buffer[2], 999);
+        if (total_both_sides >= gridDim.x - 1) {
+            // Reset the counter for the next kernel launch
+            // (cycle through multiple buffers to support kernels running in parallel)
+            zeroed_scratch_buffer[0] = 0;
+            zeroed_scratch_buffer[1] = 0;
+            zeroed_scratch_buffer[2] = 0;
         }
+        shared_sm_side_index = sm_side_index;
+    }
+    __syncthreads();
+    sm_side_index = shared_sm_side_index;
+    #endif
+
+    if (sm_side_index >= num_sm_per_side) {
+        return;
     }
 
     // Side calculation: if 2MiB aligned, we don't need a base if we adjust the side based on bit 21 (4MiB unaligned)
@@ -235,9 +254,9 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
     // Chunks
     constexpr int CHUNK_OFFSET = 4096 / vector_bytes;
     constexpr int DOUBLE_CHUNK_OFFSET = 2 * CHUNK_OFFSET;
-    constexpr size_type MULTI_CHUNK_OFFSET = unrolled * DOUBLE_CHUNK_OFFSET;
+    constexpr size_type MULTI_CHUNK_OFFSET = UNROLLED * DOUBLE_CHUNK_OFFSET;
     int num_double_chunks = num_vectors_16B / (size_type)DOUBLE_CHUNK_OFFSET;
-    int multi_chunks = num_double_chunks / unrolled;
+    int multi_chunks = num_double_chunks / UNROLLED;
 
     // Groups and indices
     // Up to 4 groups (blockDim.y) of 256 threads each (blockDim.x)
@@ -253,11 +272,12 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
     size_type offset_increment_outer = (MULTI_CHUNK_OFFSET * groups_per_side) * (reverse_order ? -1 : 1);
 
     // Loop variables (worst case register pressure is very roughly all of this live at the same time)
-    size_type offsets[unrolled];
-    vi0 in0[unrolled];
-    vi1 in1[unrolled];
-    vi2 in2[unrolled];
-    vi3 in3[unrolled];
+    size_type offsets[UNROLLED];
+    bool skip[UNROLLED];
+    vi0 in0[UNROLLED];
+    vi1 in1[UNROLLED];
+    vi2 in2[UNROLLED];
+    vi3 in3[UNROLLED];
     vo0 out0;
     vo1 out1;
     vo2 out2;
@@ -265,8 +285,8 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
 
     #pragma unroll 1
     for (int i = global_idx; i < multi_chunks; i += groups_per_side, global_offset += offset_increment_outer) {
-        #pragma unroll unrolled
-        for (int j = 0; j < unrolled; j++) {
+        #pragma unroll UNROLLED
+        for (int j = 0; j < UNROLLED; j++) {
             size_type offset = global_offset + (j * DOUBLE_CHUNK_OFFSET);
 
             // Determine the side of the 1st 4KiB chunk in this 8KiB "double chunk"
@@ -285,42 +305,54 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
             offset += (use_second_chunk * CHUNK_OFFSET);
 
             offsets[j] = offset;
-            in0[j] = load<input_evict[0]>(input0 + offset);
-            in1[j] = load<input_evict[1]>(input1 + offset);
-            in2[j] = load<input_evict[2]>(input2 + offset);
-            in3[j] = load<input_evict[3]>(input3 + offset);
+            size_type offsets_i[4] = {0};
+            skip[j] = indexing(offset, vec_size, offsets_i[0], offsets_i[1], offsets_i[2], offsets_i[3], mem, val);
+
+            if (skip[j] == false) {
+                in0[j] = load<input_evict[0]>(input0 + offsets_i[0]);
+                in1[j] = load<input_evict[1]>(input1 + offsets_i[1]);
+                in2[j] = load<input_evict[2]>(input2 + offsets_i[2]);
+                in3[j] = load<input_evict[3]>(input3 + offsets_i[3]);
+            }
         }
 
-        // Execute operation and store results *after* the loads for every unrolled iteration
+        // Execute operation and store results *after* the loads for every UNROLLED iteration
         // In theory, the compiler should be able to reorder things to maximise memory parallelism either way...
         // In practice, this is the only way to get it to reliably do the right thing (all indexing is optimized away)
-        #pragma unroll unrolled
-        for (int j = 0; j < unrolled; j++) {
-            size_type offset = offsets[j];
-            vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[j], +in1[j], +in2[j], +in3[j], mem, val);
-            store(output0 + offset, out0);
-            store(output1 + offset, out1);
-            store(output2 + offset, out2);
-            store(output3 + offset, out3);
+        #pragma unroll UNROLLED
+        for (int j = 0; j < UNROLLED; j++) {
+            if (skip[j] == false) {
+                size_type offset = offsets[j];
+                vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[j], +in1[j], +in2[j], +in3[j], mem, val);
+                store(output0 + offset, out0);
+                store(output1 + offset, out1);
+                store(output2 + offset, out2);
+                store(output3 + offset, out3);
+            }
         }
 
         // Optional discard needs to happen after the stores otherwise performance is extremely bad (due to fences?)
-        #pragma unroll unrolled
-        for (int j = 0; j < unrolled; j++) {
-            size_type offset = offsets[j];
-            discard_inputs(input0 + offset, input1 + offset, input2 + offset, input3 + offset);
+        #ifdef DISCARD_INPUTS
+        #pragma unroll UNROLLED
+        for (int j = 0; j < UNROLLED; j++) {
+            if (skip[j] == false) {
+                size_type offsets_i[4] = {0};
+                indexing(offsets[j], vec_size, offsets_i[0], offsets_i[1], offsets_i[2], offsets_i[3], mem, val);
+                discard_inputs(input0+offsets_i[0], input1+offsets_i[1], input2+offsets_i[2], input3+offsets_i[3]);
+            }
         }
+        #endif
     }
 
-    // Handle everything that isn't a multiple of MULTI_CHUNK_OFFSET (i.e. 32KiB with unrolled = 4)
+    // Handle everything that isn't a multiple of MULTI_CHUNK_OFFSET (i.e. 32KiB with UNROLLED = 4)
     // Try to process this on the 'last SMs' that are most likely to require one less 'full' iteration
     // Worst case we need 8 SMs (4 per side) to process 32KiB so we don't need more than 1 group per SM
     if (group == 0) {
-        int max_remaining_double_chunks = (num_double_chunks + 1) - (multi_chunks * unrolled);
+        int max_remaining_double_chunks = (num_double_chunks + 1) - (multi_chunks * UNROLLED);
         int start_sm_side_idx = num_sm_per_side - max_remaining_double_chunks;
         int idx = sm_side_index - start_sm_side_idx;
         if (idx >= 0) {
-            size_type offset = (size_type)(idx + multi_chunks * unrolled) * DOUBLE_CHUNK_OFFSET;
+            size_type offset = (size_type)(idx + multi_chunks * UNROLLED) * DOUBLE_CHUNK_OFFSET;
             offset += group_tid_offset;
 
             unsigned int lsb_bits = base + (offset & 0xFFFFFFFF);
@@ -329,17 +361,25 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
             offset += (use_second_chunk * CHUNK_OFFSET);
 
             if (offset < num_vectors_16B) {
-                in0[0] = load<input_evict[0]>(input0 + offset);
-                in1[0] = load<input_evict[1]>(input1 + offset);
-                in2[0] = load<input_evict[2]>(input2 + offset);
-                in3[0] = load<input_evict[3]>(input3 + offset);
+                size_type offsets_i[4] = {0};
+                skip[0] = indexing(offset, vec_size, offsets_i[0], offsets_i[1], offsets_i[2], offsets_i[3], mem, val);
+                if (skip[0]) {
+                    return;
+                }
+
+                in0[0] = load<input_evict[0]>(input0 + offsets_i[0]);
+                in1[0] = load<input_evict[1]>(input1 + offsets_i[1]);
+                in2[0] = load<input_evict[2]>(input2 + offsets_i[2]);
+                in3[0] = load<input_evict[3]>(input3 + offsets_i[3]);
 
                 vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[0], +in1[0], +in2[0], +in3[0], mem, val);
                 store(output0 + offset, out0);
                 store(output1 + offset, out1);
                 store(output2 + offset, out2);
                 store(output3 + offset, out3);
-                discard_inputs(input0 + offset, input1 + offset, input2 + offset, input3 + offset);
+                #ifdef DISCARD_INPUTS
+                discard_inputs(input0+offsets_i[0], input1+offsets_i[1], input2+offsets_i[2], input3+offsets_i[3]);
+                #endif
             }
         }
     }
@@ -352,8 +392,8 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
 //#define DEBUG_PRINTF
 constexpr bool   ALWAYS_OUTPUT_SASS = false;   // always output assembly to "sass" file (even if filename is empty)
 constexpr bool   ALWAYS_TRY_CUDA_FREE = true;  // cudaFreeAsync for unknown pointers (e.g. if alloc threshold changes)
-constexpr bool   ALWAYS_SET_DEVICE = true;     // ScopedSetDevice to set & restore device (is this really necesssary?)
-constexpr int    DEFAULT_PARALLEL_CHUNKS = 4;  // number of 256 threads "groups" (blockDim.y) per SM (max 4 on H100)
+constexpr bool   ALWAYS_SET_DEVICE = true;     // ScopedSetDevice to set & restore device (probably too conservative?)
+constexpr int    DEFAULT_PARALLEL_GROUPS = 4;  // number of 256 threads "groups" (blockDim.y) per SM (max 4 on H100)
 constexpr bool   SYNC_ON_EVERY_ALLOC = false;  // sync when (pre)allocating memory to avoid confusing async errors
 constexpr bool   ZERO_ON_PREALLOC = false;     // zero out memory when preallocating physical memory
 
@@ -450,6 +490,7 @@ struct DeviceContext {
 
     std::vector<KernelCacheEntry> kernel_cache;       // index = header ID (0 default)
     std::vector<std::string>      header_strings;     // same index – header source
+    std::vector<int>              default_num_groups; // same index – default number of groups
     std::unordered_map<std::string,int> header_to_id; // reverse lookup
 };
 
@@ -585,6 +626,8 @@ private:
 
 // ---------------------------------------------------------------------------
 // Device functions & kernels for side info
+// See the following example for simpler code with more comments:
+// https://github.com/ademeure/QuickRunCUDA/blob/main/tests/side_aware.cu
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ int test_latency_l2(unsigned int* data, size_t offset) {
     unsigned int old_value = atomicExch(&data[offset], 0); // also warms up the cache!
@@ -718,6 +761,7 @@ static DeviceContext& get_device_context(int device=-1) {
 
     DeviceContext& ctx = g_deviceContexts[device];
     if (!ctx.initialized) {
+        // initialize on first get_device_context()
         ctx.device_id = device;
         ctx.initialize(0);
     }
@@ -768,7 +812,6 @@ static CUfunction sideaware_get_kernel(DeviceContext &ctx, int kernel_id, bool u
     return entry.funcs[idx];
 }
 
-// Query the device allocation constraints
 static void init_allocation_constraints(DeviceContext& ctx)
 {
     int comp_available;
@@ -789,18 +832,6 @@ static void init_allocation_constraints(DeviceContext& ctx)
         res = cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
         assert(res == CUDA_SUCCESS && granularity == PAGE_SIZE);
     }
-}
-
-static CUmemAllocationProp get_allocation_constraints(DeviceContext& ctx, bool compression=false)
-{
-    compression &= ctx.compression_available;
-
-    CUmemAllocationProp prop = {};
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = ctx.device_id;
-    prop.allocFlags.compressionType = compression ? CU_MEM_ALLOCATION_COMP_GENERIC : 0;
-    return prop;
 }
 
 void DeviceContext::initialize(cudaStream_t stream) {
@@ -828,10 +859,11 @@ void DeviceContext::initialize(cudaStream_t stream) {
     for (int i = 0; i < MAX_SM; i++) {
         param_sm_side.side_index[i] = cpu_side_index[i];
     }
+    default_num_groups.resize(1);
     header_strings.resize(1);
     kernel_cache.resize(1);
     header_strings[0] = SIDEAWARE_MEMCPY_HEADER; // ID 0 = memcpy
-
+    default_num_groups[0] = DEFAULT_PARALLEL_GROUPS;
     initialized = true;
 }
 
@@ -901,7 +933,12 @@ static size_t release_unused_memory_device(int device) {
 // ---------------------------------------------------------------------------
 static CUresult sideaware_preallocate(DeviceContext& ctx, int countNeeded, bool compression, cudaStream_t stream)
 {
-    CUmemAllocationProp prop = get_allocation_constraints(ctx, compression);
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = ctx.device_id;
+    prop.allocFlags.compressionType = compression ? CU_MEM_ALLOCATION_COMP_GENERIC : 0;
+
     CUresult lastError = CUDA_SUCCESS;
     int totalAllocated = 0;
 
@@ -1214,23 +1251,25 @@ static void* sideaware_malloc_large(DeviceContext& ctx, size_t size, cudaStream_
     return sideaware_try_allocate(ctx, size, stream);
 }
 
-static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t stream, bool try_cuda_free = false)
+static cudaError_t sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t stream, bool try_cuda_free = false)
 {
-    if (!ptr) return;
+    if (!ptr) return cudaSuccess;
     auto it = ctx.large_alloc_registry.find(ptr);
     if (it == ctx.large_alloc_registry.end()) {
         if (ALWAYS_TRY_CUDA_FREE || try_cuda_free) {
-            cudaFreeAsync(ptr, stream);
+            return cudaFreeAsync(ptr, stream);
         } else {
             printf("ERROR: Failed to find large allocation %p to free on device %d\n", ptr, ctx.device_id);
+            return cudaErrorMemoryAllocation;
         }
-        return;
+        return cudaErrorUnknown;
     }
 
     LargeAllocInfo info = it->second;
     ctx.large_alloc_registry.erase(it);
     ctx.large_alloc_cache[info.aligned_size + (int)info.use_compression].push_back(info);
     ctx.total_mapped_free += info.aligned_size;
+    return cudaSuccess;
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,14 +1277,31 @@ static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t str
 // ---------------------------------------------------------------------------
 extern "C" {
 
-void* sideaware_malloc(size_t size, cudaStream_t stream) {
-    debugf("sideaware_malloc(%zu, %p)\n", size, stream);
-    return sideaware_malloc_large(get_device_context(), size, stream);
+cudaError_t sideaware_malloc_async(void** devPtr, size_t size, cudaStream_t stream) {
+    debugf("sideaware_malloc_async(%zu, %p)\n", size, stream);
+    *devPtr = sideaware_malloc_large(get_device_context(), size, stream);
+    return (*devPtr) ? cudaSuccess : cudaErrorMemoryAllocation;
 }
 
-void sideaware_free(void* ptr, cudaStream_t stream) {
-    debugf("sideaware_free(%p, %p)\n", ptr, stream);
-    sideaware_free_large(get_device_context(), ptr, stream);
+cudaError_t sideaware_free_async(void* ptr, cudaStream_t stream) {
+    debugf("sideaware_free_async(%p, %p)\n", ptr, stream);
+    return sideaware_free_large(get_device_context(), ptr, stream);
+}
+
+// Synchronous versions sync first & assert on earlier async errors
+cudaError_t sideaware_malloc(void** devPtr, size_t size) {
+    debugf("sideaware_malloc(%zu)\n", size);
+
+    checkCudaErrors(cudaDeviceSynchronize());
+    *devPtr = sideaware_malloc_large(get_device_context(), size, 0);
+
+    return (*devPtr) ? cudaSuccess : cudaErrorMemoryAllocation;
+}
+
+cudaError_t sideaware_free(void* ptr) {
+    debugf("sideaware_free(%p)\n", ptr);
+    checkCudaErrors(cudaDeviceSynchronize());
+    return sideaware_free_large(get_device_context(), ptr, 0);
 }
 
 size_t sideaware_release_unused() {
@@ -1304,10 +1360,10 @@ void sideaware_elementwise(int kernel_id,
                            void* out0, void* out1, void* out2, void* out3,
                            const void* in0, const void* in1, const void* in2, const void* in3,
                            void* sideband_memory, int sideband_value,
-                           int parallel_chunks, int forced_per_side,
+                           int parallel_groups, int forced_per_side,
                            int device, cudaStream_t stream)
 {
-    if (num_bytes == 0 || out0 == nullptr || in0 == nullptr) return;
+    if (num_bytes == 0 || (out0 == nullptr && in0 == nullptr)) return;
     ScopedSetDevice guard(device);
     DeviceContext& ctx = get_device_context(device);
     CUstream cuStream = reinterpret_cast<CUstream>(stream);
@@ -1319,12 +1375,16 @@ void sideaware_elementwise(int kernel_id,
     assert(num_bytes % 16 == 0);
 
     unsigned int sm_per_side = (forced_per_side > 0) ? forced_per_side : ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
-    int num_groups = parallel_chunks > 0 ? parallel_chunks : DEFAULT_PARALLEL_CHUNKS;
     long long num_vectors_64b = num_bytes / sizeof(uint4);
     int num_vectors_32b = (int)num_vectors_64b;
 
+    // Groups of 256 threads (less than 4 combined with customed __launch_bounds__ allows for higher register usage)
+    int num_groups = parallel_groups > 0 ? parallel_groups : ctx.default_num_groups[kernel_id];
+
+    // currently only support "fast" and "slow" paths which mean unaligned pointers use 64-bit indexing
+    // previously had all 4 possible combinations, not convinced it's worth it unless everything is unaligned (bad)
     bool misaligned_2MiB = ((intptr_t)in0 % (2ULL*1024*1024)) || ((intptr_t)out0 % (2ULL*1024*1024));
-    bool need_64b_indexing = (num_bytes < 2ULL*1024*1024*1024);
+    bool need_64b_indexing = (num_bytes >= 2ULL*1024*1024*1024);
     bool use_slow_path = need_64b_indexing || misaligned_2MiB;
 
     void* args[14];
@@ -1337,11 +1397,11 @@ void sideaware_elementwise(int kernel_id,
     args[6] = &in1;
     args[7] = &in2;
     args[8] = &in3;
-    args[9] = &sideband_memory;
-    args[10] = &sideband_value;
-    args[11] = &sm_per_side;
-    args[12] = &ctx.gpu_scratch_zeroed_buffer;
-    args[13] = &ctx.param_sm_side;
+    args[9] = &sideband_memory; // user-provided pointer passed as-is to vector_op (e.g. FP8 micro-scaling factors)
+    args[10] = &sideband_value; // user-provided sideband (e.g. value for memset)
+    args[11] = &sm_per_side; // SMs per side to execute on (must always launch 1 threadgroup per SM then early exit)
+    args[12] = &ctx.gpu_scratch_zeroed_buffer; // used for dynamic SM side index atomics (always reset to 0)
+    args[13] = &ctx.param_sm_side; // kernel MAX_SM may be smaller than CPU MAX_SM to reduce overhead
 
     CUfunction kernel = sideaware_get_kernel(ctx, kernel_id, use_slow_path);
     cuLaunchKernel(kernel, ctx.num_sms, 1, 1, 256, num_groups, 1, 0, cuStream, args, nullptr);
@@ -1356,18 +1416,21 @@ void sideaware_memcpy(void* out, const void* in, size_t num_bytes, int device, c
 }
 
 // ---------------------------------------------------------------------------
-// Compile custom elementwise kernel with provided header (compiled with NVRTC)
+// Create custom elementwise kernel with provided header (compiled with NVRTC)
 // ---------------------------------------------------------------------------
-int sideaware_compile(const char* header, bool precompile) {
+int sideaware_create_kernel_advanced(const char* header, bool precompile, int default_num_groups) {
     if (!header || strlen(header)==0) {
         return 0; // ID 0 = memcpy
     }
-
+    if (default_num_groups <= 0) {
+        default_num_groups = DEFAULT_PARALLEL_GROUPS;
+    }
     int kernel_idx = -1;
     std::string hdr_str(header);
+    DeviceContext& current_ctx = get_device_context(0);
 
     for (size_t i = 0; i < g_deviceContexts.size(); i++) {
-        DeviceContext& ctx = g_deviceContexts[i];
+        DeviceContext& ctx = get_device_context(i);
         auto it = ctx.header_to_id.find(hdr_str);
         if (it != ctx.header_to_id.end()) {
             assert(i == 0 || kernel_idx == it->second);
@@ -1375,68 +1438,73 @@ int sideaware_compile(const char* header, bool precompile) {
             continue;
         }
 
-        int new_id = ctx.header_strings.size();
+        ctx.default_num_groups.push_back(default_num_groups);
         ctx.header_strings.push_back(hdr_str);
         ctx.kernel_cache.emplace_back();
+
+        int new_id = ctx.header_strings.size() - 1;
         ctx.header_to_id[hdr_str] = new_id;
 
         assert(i == 0 || kernel_idx == new_id);
         kernel_idx = new_id;
     }
 
-    // Optionally precompile the kernel on the current device
+    // Optionally precompile the kernel on device 0
     if (precompile) {
-        DeviceContext& ctx = get_device_context();
-        assert(sideaware_get_kernel(ctx, kernel_idx, false) != nullptr);
-        assert(sideaware_get_kernel(ctx, kernel_idx, true) != nullptr);
+        assert(sideaware_get_kernel(current_ctx, kernel_idx, false) != nullptr);
+        assert(sideaware_get_kernel(current_ctx, kernel_idx, true) != nullptr);
     }
     return kernel_idx;
+}
+
+int sideaware_create_kernel(const char* header) {
+    return sideaware_create_kernel_advanced(header, false, DEFAULT_PARALLEL_GROUPS);
 }
 
 // ---------------------------------------------------------------------------
 // Configuration functions
 // ---------------------------------------------------------------------------
-void use_compression(bool value) {
-    g_use_compression = value;
+void sideaware_compression(bool enable) {
+    g_use_compression = enable;
 }
 
-void set_custom_alloc_threshold(size_t threshold) {
+void sideaware_alloc_threshold(size_t threshold) {
     g_custom_alloc_threshold = threshold;
 }
 
-void set_prealloc_config(int extra_required, int extra_alloc) {
+void sideaware_prealloc_config(int extra_required, int extra_alloc) {
     g_prealloc_extra_required = extra_required;
     g_prealloc_extra_alloc = extra_alloc;
 }
 
-void set_free_mapped_thresholds(size_t start_threshold, size_t end_threshold) {
+void sideaware_free_mapped_thresholds(size_t start_threshold, size_t end_threshold) {
     g_free_mapped_start_threshold = start_threshold;
     g_free_mapped_end_threshold = end_threshold;
 }
 
-void set_sass_filename(const char* filename) {
+void sideaware_write_sass(const char* filename) {
     g_sass_filename = std::string(filename);
 }
 
 // ---------------------------------------------------------------------------
 // Query functions
 // ---------------------------------------------------------------------------
-void fill_gpu_side_index(unsigned char* gpu_array) {
+void sideaware_fill_side_index(unsigned char* gpu_array) {
     DeviceContext& ctx = get_device_context();
     assert(cudaMemcpy(gpu_array, ctx.gpu_side_index, ctx.num_sms, cudaMemcpyDeviceToDevice) == cudaSuccess);
 }
 
-const char* get_gpu_side_index() {
+const char* sideaware_gpu_side_index() {
     DeviceContext& ctx = get_device_context();
     return (const char*)ctx.gpu_side_index;
 }
 
-const char* get_cpu_side_index() {
+const char* sideaware_cpu_side_index() {
     DeviceContext& ctx = get_device_context();
     return (const char*)ctx.param_sm_side.side_index;
 }
 
-const int* get_sm_side_summary()
+const int* sideaware_sm_side_summary()
 {
     DeviceContext& ctx = get_device_context();
     ctx.side_summary[0] = ctx.num_sms;
@@ -1447,10 +1515,57 @@ const int* get_sm_side_summary()
     return ctx.side_summary;
 }
 
-int get_num_sms() { return get_device_context().num_sms; }
-int get_num_sm_side0() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE0]; }
-int get_num_sm_side1() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE1]; }
-int get_min_sm_per_side() { return get_device_context().cpu_side_info[OFFSET_MIN_SM_PER_SIDE]; }
-int get_hash_mask() { return get_device_context().cpu_side_info[OFFSET_SIDE_HASH_MASK]; }
+int sideaware_num_sms() { return get_device_context().num_sms; }
+int sideaware_num_sm_side0() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE0]; }
+int sideaware_num_sm_side1() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE1]; }
+int sideaware_min_sm_per_side() { return get_device_context().cpu_side_info[OFFSET_MIN_SM_PER_SIDE]; }
+int sideaware_hash_mask() { return get_device_context().cpu_side_info[OFFSET_SIDE_HASH_MASK] | (1 << SIDE_HASH_BIT); }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// C++ convenience wrappers when included directly (type‑safe like cudaMalloc)
+// ---------------------------------------------------------------------------
+#ifdef __cplusplus
+
+// Memory allocation
+template <typename T>
+static inline cudaError_t sideaware_malloc(T** devPtr, size_t size) {
+    return ::sideaware_malloc(reinterpret_cast<void**>(devPtr), size);
+}
+template <typename T>
+static inline cudaError_t sideaware_malloc_async(T** devPtr, size_t size, cudaStream_t stream = 0) {
+    return ::sideaware_malloc_async(reinterpret_cast<void**>(devPtr), size, stream);
+}
+template <typename T>
+static inline cudaError_t sideaware_free(T* ptr) {
+    return ::sideaware_free(reinterpret_cast<void*>(ptr));
+}
+template <typename T>
+static inline cudaError_t sideaware_free_async(T* ptr, cudaStream_t stream = 0) {
+    return ::sideaware_free_async(reinterpret_cast<void*>(ptr), stream);
+}
+// Kernels
+template <typename T>
+static inline cudaError_t sideaware_elementwise(int kernel_id, T num_bytes, void* out0,
+                                                void* out1=nullptr, void* out2=nullptr, void* out3=nullptr,
+                                                const void* in0=nullptr, const void* in1=nullptr,
+                                                const void* in2=nullptr, const void* in3=nullptr,
+                                                void* sideband_memory=nullptr, int sideband_value=0,
+                                                int parallel_chunks=0, int forced_per_side=0,
+                                                int device=0, cudaStream_t stream=0) {
+    return ::sideaware_elementwise(kernel_id, num_bytes, out0, out1, out2, out3, in0, in1, in2, in3,
+                                   sideband_memory, sideband_value,
+                                   parallel_chunks, forced_per_side, device, stream);
+}
+template <typename T>
+static inline int sideaware_one_to_one(int kernel_id, T num_bytes, void* out0,
+                                       const void* in0 = nullptr, int device = 0, cudaStream_t stream = 0) {
+    return ::sideaware_one_to_one(kernel_id, num_bytes, out0, in0, device, stream);
+}
+template <typename T>
+static inline int sideaware_memcpy(void* out, const void* in, T num_bytes,
+                                   int device = 0, cudaStream_t stream = 0) {
+    return ::sideaware_memcpy(out, in, num_bytes, device, stream);
+}
+#endif // __cplusplus

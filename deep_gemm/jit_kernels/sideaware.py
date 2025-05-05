@@ -1,3 +1,13 @@
+# ---------------------------------------------------------------------------
+# CUDA L2 Side Boost wrapper originally created for DeeperGEMM
+# Useful as an example of how it can be integrated with PyTorch
+# ---------------------------------------------------------------------------
+# Remember to compile sideaware.so in /deep_gemm/include/l2_torch_alloc:
+# nvcc -arch=native -Xcompiler -fPIC -shared sideaware.cu -o sideaware.so -lcuda -lnvrtc
+# ---------------------------------------------------------------------------
+# https://github.com/ademeure/cuda-side-boost
+# https://github.com/ademeure/DeeperGEMM
+# ---------------------------------------------------------------------------
 import torch
 import ctypes
 
@@ -15,8 +25,8 @@ def sideaware_enabled():
     return _lib and 1 or 0
 
 # Create custom elementwise kernels (returns id for sideaware_elementwise)
-def sideaware_compile(header_code: bytes, force_recompile: bool = True) -> int:
-    return _lib.sideaware_compile(header_code, force_recompile)
+def sideaware_create_kernel(header_code: bytes) -> int:
+    return _lib.sideaware_create_kernel(header_code)
 
 # GPU SM side metadata (which SM is on which side, SMs per side, etc...)
 def sideaware_torch_side_index():
@@ -43,18 +53,18 @@ def sideaware_init(path = 'sideaware.so'):
     _lib = ctypes.CDLL(path)
 
     # Define C-style function signatures
-    _lib.sideaware_compile.argtypes = [ctypes.c_char_p, ctypes.c_bool]
-    _lib.sideaware_compile.restype = ctypes.c_int
+    _lib.sideaware_create_kernel.argtypes = [ctypes.c_char_p]
+    _lib.sideaware_create_kernel.restype = ctypes.c_int
 
-    _lib.get_sm_side_summary.argtypes = []
-    _lib.get_sm_side_summary.restype = ctypes.POINTER(ctypes.c_int * 5)
+    _lib.sideaware_sm_side_summary.argtypes = []
+    _lib.sideaware_sm_side_summary.restype = ctypes.POINTER(ctypes.c_int * 5)
 
-    _lib.fill_gpu_side_index.argtypes = [ctypes.c_void_p]
-    _lib.fill_gpu_side_index.restype = None
-    _lib.get_gpu_side_index.argtypes = []
-    _lib.get_gpu_side_index.restype = ctypes.c_void_p
-    _lib.get_cpu_side_index.argtypes = []
-    _lib.get_cpu_side_index.restype = ctypes.c_void_p
+    _lib.sideaware_fill_side_index.argtypes = [ctypes.c_void_p]
+    _lib.sideaware_fill_side_index.restype = None
+    _lib.sideaware_gpu_side_index.argtypes = []
+    _lib.sideaware_gpu_side_index.restype = ctypes.c_void_p
+    _lib.sideaware_cpu_side_index.argtypes = []
+    _lib.sideaware_cpu_side_index.restype = ctypes.c_void_p
 
     _lib.sideaware_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
     _lib.sideaware_memcpy.restype = None
@@ -86,13 +96,13 @@ def sideaware_init(path = 'sideaware.so'):
 
     # Initialize sideaware metadata
     global _info, _info_str, _torch_side_index, _gpu_side_index, _cpu_side_index
-    _info = tuple(_lib.get_sm_side_summary().contents)
+    _info = tuple(_lib.sideaware_sm_side_summary().contents)
     _info_str = { "num_sms": _info[0], "side0": _info[1], "side1": _info[2], "min": _info[3], "hash": _info[4] }
 
     _torch_side_index = torch.zeros(_info_str["num_sms"], dtype=torch.uint8, device="cuda")
-    _lib.fill_gpu_side_index(_torch_side_index.data_ptr())
-    _gpu_side_index = _lib.get_gpu_side_index()
-    _cpu_side_index = _lib.get_cpu_side_index()
+    _lib.sideaware_fill_side_index(_torch_side_index.data_ptr())
+    _gpu_side_index = _lib.sideaware_gpu_side_index()
+    _cpu_side_index = _lib.sideaware_cpu_side_index()
 
     # Print metadata (shows we are done with initialization)
     print(f"L2 Side Aware metadata: {_info_str}")
@@ -101,7 +111,7 @@ def sideaware_init(path = 'sideaware.so'):
 # Exposed via torch.ops.sideaware.[memcpy/one_to_one/elementwise]() only
 # -----------------------------------------------------------------------------
 
-# Sideaware memcpy (i.e. "default kernel" when no custom kernel is provided via sideaware_compile)
+# Sideaware memcpy (i.e. "default kernel" when no custom kernel is provided via sideaware_create_kernel)
 def sideaware_memcpy(dst: torch.Tensor, src: torch.Tensor) -> None:
     # Validate inputs
     assert dst.device.type == "cuda" and src.device.type == "cuda", "Both tensors must be on CUDA"
