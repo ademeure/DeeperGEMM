@@ -12,3 +12,8 @@ from .preprocess import (
     preprocess_reorder_b,
     preprocess_reorder_b_grouped
 )
+from .sideaware import (
+    sideaware_init, sideaware_enabled, sideaware_compile,
+    sideaware_torch_side_index, sideaware_gpu_side_index, sideaware_cpu_side_index,
+    sideaware_info, sideaware_info_raw
+)

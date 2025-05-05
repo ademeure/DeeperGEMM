@@ -3,6 +3,7 @@ from typing import Tuple
 
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
+from .sideaware import sideaware_torch_side_index, sideaware_info, sideaware_enabled
 
 # C++ code templates
 includes = ('"deep_gemm/fp8_gemm.cuh"', )
@@ -16,9 +17,11 @@ constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumUnroll = {NUM_UNROLL};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
+constexpr auto kL2HashBits = {L2_HASH_BITS};
+constexpr auto kL2Optimization = {L2_OPTIMIZATION};
 
 // Make a templated GEMM
-using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumUnroll, kNumTMAMulticast, GemmType::Normal>;
+using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumUnroll, kNumTMAMulticast, GemmType::Normal, kL2HashBits, kL2Optimization>;
 
 // Launch kernel
 auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
@@ -29,7 +32,7 @@ auto tma_d_padded_desc = GemmType::make_3d_tma_d_desc(out, m);
 GemmType::run(out, rhs, rhs_scales, nullptr,
               m,
               tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc, tma_d_padded_desc,
-              stream, num_sms, smem_size);
+              stream, num_sms, smem_size, side_index);
 """
 
 
@@ -101,7 +104,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_size, sm90_capacity = None, None, 232448
     # TODO: what sizes to check?
-    for num_stages in (10, 9, 8, 7, 6, 5, 4) if 128 % best_block_n != 0 else (20, 16, 14, 12, 10, 8, 7, 6, 5, 4):
+    for num_stages in (9, 8, 7, 6, 5, 4) if 128 % best_block_n != 0 else (12, 10, 8, 7, 6, 5, 4):
         best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n)
         if best_smem_size <= sm90_capacity:
             best_num_stages = num_stages
@@ -114,9 +117,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         best_num_tma_multicast = 2
 
 
-    #print(f"best_block_m: {best_block_m}, best_block_n: {best_block_n}, best_num_stages: {best_num_stages},"
-    #      f"best_smem_size: {best_smem_size}, best_num_tma_multicast: {best_num_tma_multicast}, m: {m}, n: {n}, k: {k}"
-    #      f"==> Waves: {get_num_waves(best_block_m, best_block_n)}")
+    if False:
+        print(f"best_block_m: {best_block_m}, best_block_n: {best_block_n}, best_num_stages: {best_num_stages},"
+            f"best_smem_size: {best_smem_size}, best_num_tma_multicast: {best_num_tma_multicast}, m: {m}, n: {n}, k: {k}"
+            f"==> Waves: {get_num_waves(best_block_m, best_block_n)}")
 
 
     return best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
@@ -170,17 +174,20 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     global includes, template
     num_sms = get_num_sms()
     block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
-    args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
+    args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size,
+            sideaware_torch_side_index())
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast},
+              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast,
+              'L2_HASH_BITS': sideaware_info()["hash"], 'L2_OPTIMIZATION': sideaware_enabled()},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
                   ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16), ('m', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
+                  ('side_index', torch.uint8)),
         template=template,
         args=args
     )

@@ -86,8 +86,11 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
     # this avoid thermal throttling while keeping DVFS at maximum clocks (slight perf gain vs sleep / more consistent)
     sleep_between_tests = 0.0
     flush_l2_size = int(8e9 // 4)
+    l2_read_flusher = None
     if os.environ.get('DG_BENCH_DISABLE_L2_FLUSH', False):
         flush_l2 = False
+    elif os.environ.get('DG_BENCH_L2_FLUSH_READ_ONLY', False):
+        l2_read_flusher = torch.ones(flush_l2_size, dtype=torch.int, device='cuda')
     if os.environ.get('DG_BENCH_POWER_LIMITED', False):
         # if we want to be thermally limited, we need to run many iterations non-stop for a fairly long time
         # and spend as little time as possible doing memset and other setup work (80MiB should be enough to flush L2)
@@ -121,7 +124,12 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
                     if sleep_between_tests > 0.0:
                         time.sleep(sleep_between_tests)
                     if flush_l2:
-                        torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
+                        if l2_read_flusher is not None:
+                            if l2_read_flusher.sum() == 0:
+                                print("Impossible!")
+                            #torch.cuda.synchronize()
+                        else:
+                            torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
                     fn()
 
                 if not using_nsys:

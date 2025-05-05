@@ -3,14 +3,19 @@ from typing import Tuple
 
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div
+from .sideaware import sideaware_info, sideaware_enabled
 
 # C++ code templates
 includes = ('"deep_gemm/reorder_b.cuh"', )
 template = """
 using namespace deep_gemm;
 
+// Templated args from Python JIT call
+constexpr auto kL2HashBits = {L2_HASH_BITS};
+constexpr auto kL2Optimization = {L2_OPTIMIZATION};
+
 // Make a templated type
-using ReorderType = ReorderB<128, GemmType::{GEMM_TYPE}>;
+using ReorderType = ReorderB<128, GemmType::{GEMM_TYPE}, kL2HashBits, kL2Optimization>;
 
 // Launch kernel
 auto tma_b_desc = ReorderType::make_2d_tma_b_desc(b, n, k, num_groups);
@@ -33,7 +38,8 @@ def preprocess_reorder_b(b: torch.Tensor, out_b: torch.Tensor) -> None:
     args = (b, out_b, n, k, torch.cuda.current_stream(), num_sms, 1)
     runtime = jit_tuner.compile_and_tune(
         name='reorder_b',
-        keys={'BLOCK_K': 128, 'GEMM_TYPE': 'Normal'},
+        keys={'BLOCK_K': 128, 'GEMM_TYPE': 'Normal',
+              'L2_HASH_BITS': sideaware_info()["hash"], 'L2_OPTIMIZATION': sideaware_enabled()},
         space=(),
         includes=includes,
         arg_defs=(('b', torch.float8_e4m3fn), ('out_b', torch.float8_e4m3fn),
@@ -61,7 +67,8 @@ def preprocess_reorder_b_grouped(b: torch.Tensor, out_b: torch.Tensor, is_masked
     args = (b, out_b, n, k, torch.cuda.current_stream(), num_sms, num_groups)
     runtime = jit_tuner.compile_and_tune(
         name='reorder_b',
-        keys={'BLOCK_K': 128, 'GEMM_TYPE': 'GroupedContiguous' if not is_masked else 'GroupedMasked'},
+        keys={'BLOCK_K': 128, 'GEMM_TYPE': 'GroupedContiguous' if not is_masked else 'GroupedMasked',
+              'L2_HASH_BITS': sideaware_info()["hash"], 'L2_OPTIMIZATION': sideaware_enabled()},
         space=(),
         includes=includes,
         arg_defs=(('b', torch.float8_e4m3fn), ('out_b', torch.float8_e4m3fn),

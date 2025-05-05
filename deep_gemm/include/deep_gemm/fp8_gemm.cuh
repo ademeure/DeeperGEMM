@@ -1,6 +1,5 @@
 
 
-
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #pragma once
@@ -20,16 +19,13 @@
 namespace deep_gemm {
 
 // TODO - these settings shouldn't be here.
-constexpr int NUM_WARPS_LOADING_B = 2; // number of threads reading B in parallel, 2 max right now (4 didn't help)
-constexpr int L2_TEST_ITERATIONS = 100; // todo - rewrite the L2/page testing code and pass as sideband?
-constexpr int PADDING_N = 16; // padding for D to avoid STSM bank conflicts (todo - clearer conditions etc.)
 constexpr bool DOUBLE_PUMP = true; // todo - figure out how we can make this *always* faster (not just usually so...)
-constexpr bool DP_SCALE_256 = false; // todo - assumes A/B scales are always the same for 2 blocks, need test data here
+constexpr bool DP_SCALE_256 = true; // todo - assumes A/B scales are always the same for 2 blocks, need test data here
+
+constexpr int MAX_SM = 132;
+constexpr int PADDING_N = 16; // padding for D to avoid STSM bank conflicts (todo - clearer conditions etc.)
 constexpr int NUM_TILES_INITIAL = 32; // calxulate m/n for INITIAL tiles in parallel in prologue
 constexpr int NUM_TILES_STORAGE = 64; // 1 more every time we load B scales in a round-robin buffer
-
-constexpr uint32_t l2_hash_bits = 0x0018AB000; // for GH200 96GiB (TODO: upper bits are redundant)
-//constexpr uint32_t l2_hash_bits = 0x0018B3000; // for H100 80GiB
 
 enum class Layout {
     RowMajor,
@@ -42,18 +38,16 @@ __device__ __host__ constexpr int get_num_threads_per_sm(int block_m) {
     return (block_m == 64 ? 1 : 2) * kNumMathThreadsPerGroup + kNumTMAThreads;
 }
 
-typedef struct { // todo - redo this whole thing properly
-    uint8_t sm_side_and_idx[133];
-    uint8_t page_l2_sides[1024];
-} param_large_t;
+typedef struct {
+    uint8_t sm_side_and_idx[MAX_SM];
+} param_side_index_t;
 
 template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages, uint32_t kNumUnroll,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup,
-          bool     kTMAMulticastEnabled, uint32_t kNumBLoaders,
-          GemmType kGemmType,
-          uint32_t NUM_PAGES, uint32_t MAX_SM, uint32_t FORCED_M>
+          bool     kTMAMulticastEnabled, GemmType kGemmType, uint32_t l2_hash_bits, bool l2_optimization,
+          uint32_t FORCED_M>
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
 fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, int* grouped_layout, int* zeroed_scratch,
                 uint32_t shape_m,
@@ -63,10 +57,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                 const __grid_constant__ CUtensorMap tensor_map_d,
                 const __grid_constant__ CUtensorMap tensor_map_d_padded,
                 int block_idx_base, int aggregate_grid_size,
-                __grid_constant__ const param_large_t large_params) {
+                __grid_constant__ const param_side_index_t sideaware) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     //
-    constexpr bool L2_SIDE_OPTIMIZATION = (kGemmType != GemmType::GroupedMasked);
+    constexpr bool L2_SIDE_OPTIMIZATION = l2_optimization && (kGemmType != GemmType::GroupedMasked);
     constexpr uint32_t SHAPE_N_HALF = SHAPE_N / 2;
     constexpr uint32_t CLUSTER_BLOCK_N = BLOCK_N * (kTMAMulticastEnabled ? 2 : 1);
     constexpr uint32_t SHAPE_N_LOWER = ((SHAPE_N_HALF + CLUSTER_BLOCK_N - 1) / CLUSTER_BLOCK_N) * CLUSTER_BLOCK_N;
@@ -149,8 +143,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
     if constexpr (L2_SIDE_OPTIMIZATION) {
         int smid;
         asm("mov.u32 %0, %smid;\n" : "=r"(smid) :);
-        int side = large_params.sm_side_and_idx[smid] & 1;
-        scheduler.block_idx = large_params.sm_side_and_idx[smid] >> 1;
+        int side = sideaware.sm_side_and_idx[smid] & 1;
+        scheduler.block_idx = sideaware.sm_side_and_idx[smid] >> 1;
         scheduler.n_block_offset = !side * (SHAPE_N_LOWER / BLOCK_N);
         scheduler.grid_size /= 2;
     }
@@ -175,10 +169,12 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
     // this only works because we use static scheduling without work stealing, which has its own benefits...
     auto fetch_next_tile = [&](uint32_t& m_block_idx, uint32_t& n_block_idx) -> bool {
         scheduler.current_iter++;
-        m_block_idx = smem_tile_scheduling[scheduler.current_iter].x;
-        n_block_idx = smem_tile_scheduling[scheduler.current_iter].y;
+        int idx = scheduler.current_iter % NUM_TILES_STORAGE;
+
+        m_block_idx = smem_tile_scheduling[idx].x;
+        n_block_idx = smem_tile_scheduling[idx].y;
         if constexpr (kGemmType == GemmType::GroupedMasked) {
-            scheduler.curr_group_idx = smem_tile_scheduling[scheduler.current_iter].z;
+            scheduler.curr_group_idx = smem_tile_scheduling[idx].z;
         }
         return (m_block_idx != 0xFFFFFFFF);
     };
@@ -231,25 +227,23 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
         s++;
         if (wrap) {
             s = 0;
-            parity ^= 1;
+            parity++;
         }
     };
-
 
     if (threadIdx.x >= kNumMathThreads) {
         // TMA warp-groups for loading data - we split the threads into
         // 1) Calculating future tile m/n and loading B scales per tile (1 thread)
         // 2) Loading A data & scales (1 thread)
-        // 3) Loading B data (multiple threads/warps, expensive due to L2 side awareness, needs redesign)
-        // Unlike the others, (3) supports using multiple warps & multiple threads per warp to parallelise the L2 side calculations
-        // Trying >2 warps for (3) by increasing TMA threads to 256 didn't help (extra threads weren't the issue)
-        // Really need to rearchitect (3) to use TMA tensor loads instead of TMA 1D loads (and possibly add alignment constraints)
+        // 3) Loading B data (multiple threads/warps, expensive due to L2 side awareness, optimized PTX)
+        //
+        // (3) previously supported multiple warps to parallelise the L2 side calculations...
+        // but slower after other crazy optimizations so back to 1 warp (but multiple threads per warp)
+
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
         parity = 1; // producer starts with parity=1 (no wait)
 
-        // NOTES: thread 0 for loading A/B/A_scales per-K_BLOCK, thread 32 to load B_scales per-tile
-        // these are 2 different subprocessors, and we use threads on another subprocessor for TMA stores later
-        if (warp_idx >= kNumMathWarps && warp_idx < kNumMathWarps+kNumBLoaders) {
+        if (warp_idx == kNumMathWarps) {
             // TODO - explain this code, or better yet, rewrite all of it!
             // TODO - add back "fast path" when everything is aligned, it was much faster *sigh* (or rewrite the whole thing!!!)
             constexpr int CHUNK_SIZE = (BLOCK_N % 16) ? 8 : ((BLOCK_N % 32) ? 16 : 32); // largest chunk size that can divide BLOCK_N
@@ -263,118 +257,187 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
             }
 
             // Create a lambda to handle loading B data with different starting k_idx
-            int loader_idx = kNumBLoaders > 1 ? warp_idx-kNumMathWarps : 0;
+            int loader_idx = 0;
             int loader_tid = threadIdx.x-kNumMathThreads;
 
-            auto load_b_data = [&](int start_k_idx) {
-                if (kNumBLoaders > 1 && start_k_idx > 0) next_stage();
-                if (kNumBLoaders > 2 && start_k_idx > 1) next_stage();
-                if (kNumBLoaders > 3 && start_k_idx > 2) next_stage();
+            constexpr bool aligned_n = (SHAPE_N % BLOCK_N == 0 && SHAPE_N_LOWER % BLOCK_N == 0 && BLOCK_N % CHUNK_SIZE == 0);
 
-                if constexpr (L2_SIDE_OPTIMIZATION) {
-                    int current_shape_n = (scheduler.n_block_offset) ? SHAPE_N : SHAPE_N_LOWER;
-                    int start_page_offset = reinterpret_cast<uint64_t>(gmem_b) % (2048*1024);
-                    __nv_fp8_e4m3* b_page_start = gmem_b - start_page_offset;
-                    smem_b_base += (NUM_CHUNKS > 1) ? lane_idx * (CHUNK_SIZE * BLOCK_K) : 0;
+            if constexpr (L2_SIDE_OPTIMIZATION) {
+                int current_shape_n = (scheduler.n_block_offset) ? SHAPE_N : SHAPE_N_LOWER;
+                int start_page_offset = reinterpret_cast<uint64_t>(gmem_b) % (2048*1024);
 
-                    int global_base_offset = start_page_offset + (start_k_idx * BLOCK_K * SHAPE_N);
-                    int lane_chunk_start = (NUM_CHUNKS > 1) ? (lane_idx * CHUNK_SIZE) : 0;
+                __nv_fp8_e4m3* b_page_start = gmem_b - start_page_offset;
+                uintptr_t b_page_start_u64 = reinterpret_cast<uintptr_t>(b_page_start);
+                uint32_t b_page_start_u32[2];
+                b_page_start_u32[0] = (uint32_t)(b_page_start_u64 & 0xFFFFFFFF);
+                b_page_start_u32[1] = (uint32_t)(b_page_start_u64 >> 32L);
 
-                    // Persistently schedule over blocks to load B
-                    #pragma unroll 1
-                    while (fetch_next_tile(m_block_idx, n_block_idx)) {
-                        int n = n_block_idx * BLOCK_N;
-                        int remaining_n = current_shape_n - n;
+                smem_b_base += (NUM_CHUNKS > 1) ? lane_idx * (CHUNK_SIZE * BLOCK_K) : 0;
+
+                int global_base_offset = start_page_offset;
+                int lane_chunk_start = (NUM_CHUNKS > 1) ? (lane_idx * CHUNK_SIZE) : 0;
+
+                // Persistently schedule over blocks to load B
+                #pragma unroll 1
+                while (fetch_next_tile(m_block_idx, n_block_idx)) {
+                    int n = n_block_idx * BLOCK_N;
+
+                    int remaining_n = current_shape_n - n;
+                    n += lane_chunk_start;
+                    int n_side = (n >= SHAPE_N_HALF) ? 1 : 0;
+                    int n_half = (n_side * (-SHAPE_N_HALF)) + n;
+                    int n_dst_base = n_half + (n_half & ~31); // shift everything after bit 5 to the left by 1
+                    uint32_t tile_base_offset = global_base_offset + (n_dst_base * 128);
+                    if constexpr (kGemmType == GemmType::GroupedContiguous) {
+                        int group_offset = __ldg(grouped_layout + m_block_idx * BLOCK_M);
+                        tile_base_offset += (SHAPE_N * SHAPE_K) * group_offset;
+                    }
+
+                    // Declare early so we can use a lambda to compile 2 optimized paths based on their values
+                    int num_bytes_total;
+                    int num_bytes;
+
+                    // ----------------------------------------------------------------------------------------
+                    // Check sideaware_kernel.cuh for a simpler version of the side aware algorithm without PTX
+                    // ----------------------------------------------------------------------------------------
+                    // Custom PTX implementation of side-aware memory copy for B matrix
+                    // optimized for efficient SASS at a random driver in time (12.8)
+                    // ... because why not?
+                    // ----------------------------------------------------------------------------------------
+                    auto load_b_for_every_k = [&]() {
+                        #pragma unroll 1
+                        for (int k_idx = 0; k_idx < SHAPE_K_SCALES; k_idx++, tile_base_offset += BLOCK_K * SHAPE_N) {
+                            uint32_t smem_int_mbar = cute::cast_smem_ptr_to_uint(&full_barriers_base[s]);
+                            uint32_t smem_int_ptr = cute::cast_smem_ptr_to_uint(smem_b_base + s * SMEM_AB_SIZE_PER_STAGE);
+                            uint32_t smem_int_empty_mbar = cute::cast_smem_ptr_to_uint(&empty_barriers_base[s]);
+                            uint32_t gmem_address_u32[2];
+
+                            // wait on mbarrier (can't remember if this ended up any better than the baseline barrier.wait)
+                            asm volatile(
+                                "{\n"
+                                "    .reg .pred p;\n"
+                                "    LAB_WAIT:\n"
+                                "    mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1, 10000000;\n"
+                                "    @p bra DONE;\n"
+                                "    bra LAB_WAIT;\n"
+                                "    DONE:\n"
+                                "}\n"
+                                : : "r"(smem_int_empty_mbar), "r"(parity) : "memory"
+                            );
+
+                            // optimized PTX version of next_stage()
+                            // this was required because we had multiple warps interleaving iterations of the loop
+                            // not sure if this is actually faster than the baseline version with a single warp or not
+                            asm volatile(
+                                "{\n"
+                                "    .reg .pred p;\n"
+                                "    setp.ge.s32 p, %0, %2;\n"
+                                "    @p add.s32 %0, %0, %3;\n"
+                                "    @p add.s32 %1, %1, 1;\n"
+                                "    @!p add.s32 %0, %0, 1;\n"
+                                "}\n"
+                                : "+r"(s), "+r"(parity)
+                                : "n"(kNumStages - 1), "n"(1 - kNumStages)
+                                : "memory"
+                            );
+
+                            if (num_bytes > 0) {
+                                // Check sideaware_kernel.cuh for a simpler version of the side aware algorithm without PTX
+                                //
+                                // Determine the desired side based on the l2_hash_bits of the address (using popc)
+                                // then use this to adjust the offset as required (see sideaware_kernel.cuh)
+                                // the black magic part of this PTX is related to how we handle the unaligned case
+                                // more efficiently than in my other non-PTX version of the algorithm
+                                // it uses 'add.cc' and 'addc.u32' in a clever way to save a few instructions
+                                asm volatile(
+                                    "{\n"
+                                    "    .reg .u32 lower_bits;\n"
+                                    "    .reg .u32 tmp;\n"
+                                    "    .reg .b64 address;\n"
+                                    "    add.cc.u32 lower_bits, %2, %4;\n"
+                                    "    and.b32 tmp, lower_bits, %5;\n"
+                                    "    xor.b32 tmp, tmp, %6;\n"
+                                    "    popc.b32 tmp, tmp;\n"
+                                    "    and.b32 tmp, tmp, 0x1;\n"
+                                    "    xor.b32 tmp, tmp, 0x1;\n" // invert due to bit 21 in sideaware.cu hash
+                                    "    mad.lo.u32 %0, tmp, 4096, lower_bits;\n"
+                                    "    addc.u32 %1, %3, 0;\n"
+                                    : "=r"(gmem_address_u32[0])/*0*/,  "=r"(gmem_address_u32[1])/*1*/
+                                    : "r"(b_page_start_u32[0]) /*2*/,  "r"(b_page_start_u32[1]) /*3*/,
+                                    "r"(tile_base_offset)      /*4*/,  "r"(l2_hash_bits)        /*5*/, "r"(n_side) /*6*/
+                                    : "memory"
+                                );
+
+                                if constexpr (NUM_CHUNKS == 1) {
+                                    // Fast path with a single thread active per warp
+                                    asm volatile(
+                                        "    mov.b64 address, {%0, %1};\n"
+                                        "    cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%2], [address], %3, [%4];\n"
+                                        "    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%4], %5; \n"
+                                        "}\n"
+                                        : : "r"(gmem_address_u32[0]), "r"(gmem_address_u32[1]),
+                                            "r"(smem_int_ptr), "r"(num_bytes), "r"(smem_int_mbar), "r"(num_bytes_total)
+                                        : "memory"
+                                    );
+                                } else {
+                                    // Slow path with multiple threads where the compiler will create a loop for the TMA
+                                    // the SASS isn't optimal but extremely difficult to improve further with 'just' PTX
+                                    // (+ setp/@p to only mbarrier.arrive on a single thread)
+                                    asm volatile(
+                                        "    .reg .pred p;\n"
+                                        "    setp.eq.u32 p, %6, 0;\n"
+                                        "    mov.b64 address, {%0, %1};\n"
+                                        "    cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%2], [address], %3, [%4];\n"
+                                        "@p  mbarrier.arrive.expect_tx.shared::cta.b64 _, [%4], %5; \n"
+                                        "}\n"
+                                        : : "r"(gmem_address_u32[0]), "r"(gmem_address_u32[1]),
+                                            "r"(smem_int_ptr), "r"(num_bytes), "r"(smem_int_mbar), "r"(num_bytes_total),
+                                            "r"(lane_idx)
+                                        : "memory"
+                                    );
+                                }
+                            }
+                        }
+                    };
+
+                    if (!aligned_n && remaining_n < BLOCK_N) {
+                        // Slow path with dynamic num_byte
                         int n_to_load_warp = max(0, min(remaining_n, BLOCK_N));
                         int n_to_load_lane = (n_to_load_warp - lane_chunk_start);
 
-                        int num_bytes_total = n_to_load_warp * BLOCK_K;
-                        int num_bytes = (n_to_load_lane > CHUNK_SIZE) ? (CHUNK_SIZE*BLOCK_K) : (n_to_load_lane*BLOCK_K);
-
-                        n += lane_chunk_start;
-                        int n_side = (n >= SHAPE_N_HALF) ? 1 : 0;
-                        int n_half = (n_side * (-SHAPE_N_HALF)) + n;
-                        int n_dst_base = n_half + (n_half & ~31); // shift everything after bit 5 to the left by 1
-                        int tile_base_offset = global_base_offset + (n_dst_base * 128);
-                        if constexpr (kGemmType == GemmType::GroupedContiguous) {
-                            int group_offset = __ldg(grouped_layout + m_block_idx * BLOCK_M);
-                            tile_base_offset += (SHAPE_N * SHAPE_K) * group_offset;
-                        }
-
-                        #pragma unroll 1
-                        for (int k_idx = start_k_idx; k_idx < SHAPE_K_SCALES; k_idx += kNumBLoaders, tile_base_offset += BLOCK_K * SHAPE_N * kNumBLoaders) {
-                            // Wait consumer release
-                            auto& full_barrier = full_barriers_base[s];
-                            uint64_t* full_barrier64 = reinterpret_cast<uint64_t*>(&full_barrier);
-                            empty_barriers_base[s].wait(parity);
-
-                            if (num_bytes > 0) {
-                                __nv_fp8_e4m3* smem_address = smem_b_base + s * SMEM_AB_SIZE_PER_STAGE;
-                                int offset = tile_base_offset;
-                                int page_idx = offset >> 21;
-                                uint32_t page_side = large_params.page_l2_sides[page_idx];
-                                uint32_t address_lower_bits = (reinterpret_cast<uint64_t>(b_page_start) & 0xFFFFFFFF) + offset;
-                                int local_side =  __popc((address_lower_bits & l2_hash_bits) ^ n_side) & 1;
-                                int upper_4kib = local_side ^ page_side;
-                                __nv_fp8_e4m3* address = b_page_start + (offset + upper_4kib * 4096);
-                                // TMA instructions are for a single thread so compiler will automatically generate a loop here
-                                // This is potentially still faster than looping over the entire thing
-                                // since we can calculate page/address/etc. in parallel this way
-                                cute::SM90_BULK_COPY_G2S::copy(address, full_barrier64, smem_address, num_bytes);
-                            }
-                            if (lane_idx == 0) {
-                                full_barriers_base[s].arrive_and_expect_tx(num_bytes_total);
-                            }
-
-                            // Increment by multiple stages at once (only works with the assert below)
-                            DG_STATIC_ASSERT(kNumStages > kNumBLoaders, "kNumStages must be greater than kNumBLoaders");
-                            s = s + kNumBLoaders;
-                            if (s >= kNumStages) {
-                                s -= kNumStages;
-                                parity ^= 1;
-                            }
-                        }
-
-                        if (loader_tid == 0) {
-                            // Used for D (which now reuses an A/B pipeline stage instead of dedicated memory)
-                            empty_barriers_base[s].wait(parity);
-                            full_barriers_base[s].arrive();
-                        }
-                        next_stage();
+                        num_bytes_total = n_to_load_warp * BLOCK_K;
+                        num_bytes = (n_to_load_lane > CHUNK_SIZE) ? (CHUNK_SIZE*BLOCK_K) : (n_to_load_lane*BLOCK_K);
+                        load_b_for_every_k();
+                    } else {
+                        // Fast path where the compiler realises num_bytes is known at compile time
+                        num_bytes_total = BLOCK_N * BLOCK_K;
+                        num_bytes = CHUNK_SIZE * BLOCK_K;
+                        load_b_for_every_k();
                     }
-                } else {
-                    // legacy approach without L2 side optimization
-                    while (fetch_next_tile(m_block_idx, n_block_idx)) {
-                        for (int k_idx = start_k_idx; k_idx < SHAPE_K_SCALES; k_idx += kNumBLoaders) {
-                            auto& full_barrier = full_barriers_base[s];
-                            uint64_t* full_barrier64 = reinterpret_cast<uint64_t*>(&full_barrier);
-                            empty_barriers_base[s].wait(parity);
-                            tma_copy(&tensor_map_b, full_barrier64, smem_b_base + s * SMEM_AB_SIZE_PER_STAGE,
-                                    k_idx * BLOCK_K, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx), cluster_size);
-                            full_barriers_base[s].arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
-                            s = s + kNumBLoaders;
-                            if (s >= kNumStages) {
-                                s -= kNumStages;
-                                parity ^= 1;
-                            }
-                        }
-                        if (loader_tid == 0) {
-                            empty_barriers_base[s].wait(parity);
-                            full_barriers_base[s].arrive();
-                        }
-                        next_stage();
-                    }
-
                 }
-            };
-
-            // Call the lambda with the appropriate starting k_idx
-            load_b_data(loader_idx);
+            } else {
+                // Legacy approach without L2 side optimization
+                while (fetch_next_tile(m_block_idx, n_block_idx)) {
+                    for (int k_idx = 0; k_idx < SHAPE_K_SCALES; k_idx++) {
+                        auto& full_barrier = full_barriers_base[s];
+                        uint64_t* full_barrier64 = reinterpret_cast<uint64_t*>(&full_barrier);
+                        empty_barriers_base[s].wait(parity);
+                        tma_copy(&tensor_map_b, full_barrier64, smem_b_base + s * SMEM_AB_SIZE_PER_STAGE,
+                                k_idx * BLOCK_K, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx), cluster_size);
+                        full_barriers_base[s].arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
+                        s++;
+                        if (s >= kNumStages) {
+                            s -= kNumStages;
+                            parity++;
+                        }
+                    }
+                }
+            }
 
             // To safely deconstruct distributed shared barriers, we need another round of empty waits
             if constexpr (kTMAMulticastEnabled) {
                 if (loader_idx == 0 && lane_idx == 0) {
-                    for (int i = 0; i < kNumStages; i++) {
+                    for (int i = 0; i < kNumStages+1; i++) {
                         empty_barriers_base[s].wait(parity);
                         next_stage();
                     }
@@ -408,14 +471,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                         next_stage();
                     }
                 }
-                // Used for D (which now reuses an A/B pipeline stage instead of dedicated memory)
-                empty_barriers_base[s].wait(parity);
-                full_barriers_base[s].arrive();
-                next_stage();
             }
             // To safely deconstruct distributed shared barriers, we need another round of empty waits
             if constexpr (kTMAMulticastEnabled) {
-                for (int i = 0; i < kNumStages; i++) {
+                for (int i = 0; i < kNumStages + 1; i++) {
                     empty_barriers_base[s].wait(parity);
                     next_stage();
                 }
@@ -466,7 +525,6 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                     smem_tile_scheduling[tile_smem_idx].z = future_scheduler.curr_group_idx;
                     smem_tile_scheduling[tile_smem_idx].w = 0;
                 }
-                //////
             }
         }
     } else {
@@ -509,7 +567,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                 final_accum_bf16[i] = __float22bfloat162_rn({final_accum[i*2+0], final_accum[i*2+1]});
             }
         };
-        auto store_tile = [&] (int tile_s, int start=0, int end=WGMMA::kNumAccum) {
+        auto store_tile = [&] (int tile_s, int start=0, int end=WGMMA::kNumAccum, bool skip_to_bf16=false) {
             int current_shape_n = (scheduler.n_block_offset) ? SHAPE_N : SHAPE_N_LOWER;
 
             // Write final_accum to shared memory using STSM
@@ -519,7 +577,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
             uint32_t BLOCK_N_STORE = partially_oob ? BLOCK_N : BLOCK_N_PADDED;
 
             // Only process part of the tile at a time if possible
-            if (start == 0) final_accum_to_bf16();
+            if (start == 0 && !skip_to_bf16) final_accum_to_bf16();
 
             // Write back to shared memory using STSM
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
@@ -579,10 +637,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                     cute::tma_store_arrive();
                     cute::tma_store_wait<0>();
                 }
-                __syncwarp();
-
-                // notify the producer we no longer need this memory for D and it can be reused for A/B
-                empty_barrier_arrive(&empty_barriers_base[tile_s]);
+                asm volatile("bar.sync %0, 128;\n" :: "r"(math_wg_idx));
             }
         };
 
@@ -670,30 +725,49 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
             constexpr int idx_3 = DP_SCALE_256 ? 1 : 1;
 
             if constexpr (DOUBLE_PUMP) {
+                // Double Pumped (new-ish path)
                 assert(SHAPE_K_SCALES % 2 == 0);
-                auto tile_s = last_s;
-                int quarter_tile = WGMMA::kNumAccum / 4;
 
                 wgmma_prepare_scales(idx_0, smem_scales_b + 0, false);
-                 if (old_n_block_idx != -1) store_tile(tile_s);
-
                 next_stage();
                 wgmma_prepare_scales(idx_1, smem_scales_b + 1, DP_SCALE_256);
 
+                int tile_s = last_s;
+                final_accum_to_bf16();
+
                 warpgroup_wait<1>();
-                empty_barrier_arrive(&empty_barriers_base[last_s]);
                 next_stage();
 
-                if constexpr (!DP_SCALE_256) { promote_with_scales(0, false); }
+                if (old_n_block_idx != -1) {
+                    if constexpr (kNumMathThreads > 128) {
+                        asm volatile("bar.sync 2, %0;\n" :: "n"(kNumMathThreads));
+                        if (math_wg_idx == 0) {
+                            store_tile(tile_s, 0, WGMMA::kNumAccum, true);
+                            empty_barrier_arrive(&empty_barriers_base[tile_s]);
+                        }
+                    } else {
+                        store_tile(tile_s, 0, WGMMA::kNumAccum, true);
+                        empty_barrier_arrive(&empty_barriers_base[tile_s]);
+                    }
 
-                wgmma_prepare_scales(idx_2, smem_scales_b + 2, false);
+                    if constexpr (!DP_SCALE_256) { promote_with_scales(0, false); }
+                    wgmma_prepare_scales(idx_2, smem_scales_b + 2, false);
+
+                    if (kNumMathThreads > 128 && math_wg_idx == 1) {
+                        store_tile(tile_s, 0, WGMMA::kNumAccum, true);
+                        empty_barrier_arrive(&empty_barriers_base[tile_s]);
+                    }
+                } else {
+                    empty_barrier_arrive(&empty_barriers_base[tile_s]);
+                    if constexpr (!DP_SCALE_256) { promote_with_scales(0, false); }
+                    wgmma_prepare_scales(idx_2, smem_scales_b + 2, false);
+                }
 
                 warpgroup_wait<1>();
                 empty_barrier_arrive(&empty_barriers_base[last_s]);
                 next_stage();
 
                 if constexpr (!DP_SCALE_256) { promote_with_scales(1);}
-
                 wgmma_prepare_scales(idx_3, smem_scales_b + 3, DP_SCALE_256);
 
                 if constexpr (DP_SCALE_256)  { promote_with_scales(0, false); }
@@ -743,17 +817,9 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                 promote_with_scales(1);
 
             } else {
+                // Not Double Pumped (old-ish path)
                 // WGMMA 0
                 wgmma_prepare_scales(0, smem_scales_b + 0);
-
-                // Overlap writes of the previous MxN tile with the processing of WGMMA 0 of the current tile
-                // (This function is also called at the end for the very last tile of the workload)
-                // last_s => storage space for D (& s => input data for WGMMA in flight above)
-                if (old_n_block_idx != -1) {
-                    store_tile(last_s);
-                }// else if (old_n_block_idx != -1) {
-                //    empty_barrier_arrive(&empty_barriers_base[last_s]);
-                //}
 
                 if constexpr (SHAPE_K_SCALES > 1) {
                     // WGMMA 1
@@ -762,10 +828,22 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
 
                     // Wait for WGMMA 0 (not the one we just issued) and let the producer know it can reuse its memory
                     warpgroup_wait<1>();
+                    if constexpr (kNumMathThreads > 128) {
+                        asm volatile("bar.sync 2, %0;\n" :: "n"(kNumMathThreads));
+                    }
+                    if (old_n_block_idx != -1) {
+                        store_tile(last_s);
+                    }
                     empty_barrier_arrive(&empty_barriers_base[last_s]);
                 } else {
                     // Special case: single K_BLOCK so we don't need any other WGMMAs and we can just wait on WGMMA 0
                     warpgroup_wait<0>();
+                    if constexpr (kNumMathThreads > 128) {
+                        asm volatile("bar.sync 2, %0;\n" :: "n"(kNumMathThreads));
+                    }
+                    if (old_n_block_idx != -1) {
+                        store_tile(s);
+                    }
                     empty_barrier_arrive(&empty_barriers_base[s]);
                 }
 
@@ -824,14 +902,12 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
             // Need to wait for space to store D (reusing memory from a stage of A/B) and store n/idx
             old_global_idx = scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx);
             old_n_block_idx = n_block_idx;
-            full_barriers_base[s].wait(parity);
-            next_stage();
         }
 
         if (scheduler.current_iter > 0) {
             // Store the final tile to global memory
-
-            store_tile(last_s);
+            store_tile(s);
+            empty_barrier_arrive(&empty_barriers_base[s]);
         }
     }
 #else
@@ -840,86 +916,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
 #endif
 }
 
-template<int MAX_SM=132>
-__global__ void l2_side_per_sm(uint32_t* sm_side, uint32_t* data) {
-    if (threadIdx.x == 0) {
-        int smid;
-        asm volatile("mov.u32 %0, %smid;\n" : "=r"(smid) :);
-        int offset = smid;
-        uint32_t old_value = atomicExch(&data[offset], 0); // backup old value
-
-        long long int start_clock = clock64();
-        for (int i = 0; i < L2_TEST_ITERATIONS; i++) {
-            int value = atomicAdd(&data[offset], 1);
-            offset += (value > MAX_SM*1000) ? 1 : 0; // impossible condition to make the compiler play along
-        }
-        int total_latency = clock64() - start_clock;
-        sm_side[smid] = total_latency;
-        atomicAdd(&sm_side[MAX_SM], total_latency);
-
-        int num_done = atomicAdd(&sm_side[MAX_SM+1], 1);
-        if (num_done == gridDim.x - 1) {
-            int average_latency = sm_side[MAX_SM] / gridDim.x;
-            for (int i = 0; i < MAX_SM; i++) {
-                sm_side[i] = (sm_side[i] > average_latency) ? 1 : 0;
-            }
-            sm_side[MAX_SM] = average_latency;
-        }
-        data[offset] = old_value; // restore old value
-    }
-}
-
-template<int MAX_SM=132>
-__global__ void l2_side_per_page(uint32_t* l2_side, uint32_t* data, const uint32_t* sm_side, int num_pages, int num_bytes) {
-    __nanosleep(1000);
-    if (threadIdx.x == 0) {
-        int smid;
-        asm volatile("mov.u32 %0, %smid;\n" : "=r"(smid) :);
-
-        // get side of this SM
-        int side = sm_side[smid];
-        int average_latency = sm_side[MAX_SM];
-
-        int start_offset = (reinterpret_cast<uint64_t>(data) % (2048*1024)) / sizeof(uint32_t);
-        uint32_t* data_page_start = data - start_offset;
-
-        for (int p = smid; p < num_pages; p += gridDim.x) {
-            uint32_t offset = p * (2048*1024/sizeof(uint32_t)); // 2MiB pages
-            if (p == 0) {
-                offset = start_offset;
-            }
-            else if (offset - start_offset >= num_bytes / sizeof(uint32_t)) {
-                return;
-            }
-
-            uint32_t old_value = atomicExch(&data_page_start[offset], 0); // backup old value
-
-            long long int start_clock = clock64();
-            if (start_clock == 0) start_clock = clock64();
-            for (int i = 0; i < L2_TEST_ITERATIONS; i++) {
-                int value = atomicAdd(&data_page_start[offset], 1);
-                offset += (value > 100000) ? 1 : 0; // impossible condition to make the compiler play along
-            }
-            int total_latency = clock64() - start_clock;
-            if (total_latency == 0) total_latency = clock64() - start_clock;
-            data_page_start[offset] = old_value; // restore old value
-
-            bool near_side = total_latency <= average_latency;
-            int bitmask_side =  (__popcll((reinterpret_cast<uint64_t>(&data_page_start[offset])) & l2_hash_bits) & 1);
-            int final_side = side ^ near_side ^ bitmask_side;
-
-            l2_side[p] = final_side;
-            l2_side[p + num_pages] = total_latency / (10*L2_TEST_ITERATIONS); // for debugging
-            //printf("start_offset: %d, offset: %d, average_latency: %d, total_latency: %d ==> %d\n", start_offset, offset, average_latency, total_latency, l2_side[p]);
-        }
-    }
-}
-
 template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages, uint32_t kNumUnroll,
-          uint32_t kNumTMAMulticast,
-          GemmType kGemmType,
+          uint32_t kNumTMAMulticast, GemmType kGemmType, uint32_t l2_hash_bits, bool l2_optimization,
           uint32_t FORCED_M = 0>
 class Gemm {
 private:
@@ -936,73 +936,34 @@ public:
                     const CUtensorMap& tma_scales_a_desc,
                     const CUtensorMap& tma_d_desc,
                     const CUtensorMap& tma_d_padded_desc,
-                    cudaStream_t stream, int num_sms, uint32_t smem_size) {
+                    cudaStream_t stream, int num_sms, uint32_t smem_size,
+                    unsigned char* gpu_side_index) {
         // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
         constexpr uint32_t kNumTMAThreads = 256;
         constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        constexpr int MAX_SM = 132;
-
-        constexpr int num_pages = (SHAPE_N * SHAPE_K * kNumGroups + 2048U*1024U - 1U) / (2048U*1024U) + 1;
-        assert(reinterpret_cast<uint64_t>(gmem_b) % 8192 == 0);
-        assert(num_pages <= 1024);
-
         auto kernel = fp8_gemm_kernel<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
                                       kNumGroups, kNumStages, kNumUnroll, kNumTMAThreads, kNumMathThreadsPerGroup,
-                                      (kNumTMAMulticast > 1) ? true : false, NUM_WARPS_LOADING_B, kGemmType, num_pages, MAX_SM, FORCED_M>;
+                                      (kNumTMAMulticast > 1) ? true : false, kGemmType, l2_hash_bits, l2_optimization,
+                                      FORCED_M>;
         DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
 
-        // this *will* leak but considered OK for now since it's less memory than the code itself!
-        // kernel has a sacred duty to return this memory as zero so it can easily be reused
+        // This will leak but considered OK since it's less memory than the code itself!
+        // Kernel has a sacred duty to return this memory as zero so it can easily be reused
         static int* zeroed_scratch = nullptr;
         if (zeroed_scratch == nullptr) {
             cudaMalloc(&zeroed_scratch, 256 * sizeof(int));
             cudaMemset(zeroed_scratch, 0, 256 * sizeof(int));
         }
 
-        static __nv_fp8_e4m3* previous_b = nullptr;
-        static uint32_t* gpu_l2_sides = nullptr;
-        static uint32_t cpu_l2_sides[MAX_SM+1];
-        static uint32_t sm_idx_on_side[MAX_SM];
-        static uint32_t cpu_page_l2_sides[num_pages];
-
-        if (gpu_l2_sides == nullptr || previous_b != gmem_b) {
-            previous_b = gmem_b;
-            if (gpu_l2_sides != nullptr) cudaFree(gpu_l2_sides);
-            cudaMalloc(&gpu_l2_sides, (MAX_SM+2) * sizeof(uint32_t));
-            cudaMemset(gpu_l2_sides, 0, (MAX_SM+2) * sizeof(uint32_t));
-            l2_side_per_sm<MAX_SM><<<MAX_SM, 128>>>(gpu_l2_sides, (uint32_t*)gmem_b);
-
-            cudaMemcpy(cpu_l2_sides, gpu_l2_sides, (MAX_SM+1) * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-            int side_0 = 0, side_1 = 0;
-            for (int i = 0; i < MAX_SM; i++) {
-                int side = cpu_l2_sides[i];
-                sm_idx_on_side[i] = side ? side_1 : side_0;
-                side_0 += !side;
-                side_1 += side;
-                //printf("(FP8 GEMM) SM %d: %d\n", i, side);
+        static bool init_side_index = false;
+        static param_side_index_t param_sideaware;
+        if constexpr (l2_optimization) {
+            if (!init_side_index) {
+                cudaMemcpy(param_sideaware.sm_side_and_idx, gpu_side_index, MAX_SM * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+                init_side_index = true;
             }
-            //printf("(FP8 GEMM) SM0 Side: %d\n", cpu_l2_sides[0]);
-            //printf("(FP8 GEMM) SM Side 0+1: %d+%d\n", num_sms - side_0, side_1);
-
-            uint32_t* gpu_page_l2_sides ;
-            cudaMalloc(&gpu_page_l2_sides, 2*num_pages * sizeof(uint32_t));
-            cudaMemset(gpu_page_l2_sides, 0, 2*num_pages * sizeof(uint32_t));
-
-            l2_side_per_page<<<128, 128>>>(gpu_page_l2_sides, (uint32_t*)gmem_b, gpu_l2_sides, num_pages, SHAPE_N * SHAPE_K * kNumGroups);
-            cudaMemcpy(cpu_page_l2_sides, gpu_page_l2_sides, num_pages * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-            cudaFree(gpu_page_l2_sides);
-
-            //printf("\n");
-            for (int i = 0; i < num_pages; i++) {
-                //printf("%2d ", cpu_page_l2_sides[i]);
-            }
-            //printf("\n\n");
         }
-
-        param_large_t large_params;
-        for (int i = 0; i < MAX_SM; i++) large_params.sm_side_and_idx[i] = sm_idx_on_side[i] << 1 | cpu_l2_sides[i];
-        for (int i = 0; i < num_pages; i++) large_params.page_l2_sides[i] = cpu_page_l2_sides[i];
-        large_params.sm_side_and_idx[MAX_SM] = cpu_l2_sides[MAX_SM] / L2_TEST_ITERATIONS;
+        assert(reinterpret_cast<uint64_t>(gmem_b) % 8192 == 0);
 
         // Cluster launch
         cudaLaunchConfig_t config;
@@ -1011,7 +972,6 @@ public:
         config.stream = stream;
 
         // Clusters for TMA multicast
-        // TODO: Explain "Hybrid Cluster Size" properly
         if constexpr (kNumTMAMulticast <= 1) {
             cudaLaunchAttribute attr;
             attr.id = cudaLaunchAttributeClusterDimension;
@@ -1022,90 +982,25 @@ public:
             auto status = cudaLaunchKernelEx(&config, kernel,
                                             gmem_d, gmem_b, scales_b, grouped_layout, zeroed_scratch, shape_m,
                                             tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc, tma_d_padded_desc,
-                                            0, num_sms, large_params);
+                                            0, num_sms, param_sideaware);
             DG_HOST_ASSERT(status == cudaSuccess);
-        } else if (num_sms >= 999 && (SHAPE_N % (BLOCK_N * 8)) == 0) {
-            // TODO: Fix with L2 side optimization
-            // requires using atomicAdd to get index dynamically (+add idx inside cluster)
-            // and using base_idx to start at a certain number for the 2nd set
-
-            // use 128 SMs instead of 132 for better cache locality
-            // and because otherwise everything is a mess...
-            num_sms = 128;
-
-            // use as many clusters of 8 threadgroups as possible as they are lower power
-            // TODO: if num_sms < SMs and another kernel is using the reserved SMs, we might have a problem:
-            // if the other kernel is scheduled first, AFAIK there's no guarantee the *right SMs* are still available!
-            cudaLaunchAttribute attr;
-            attr.id = cudaLaunchAttributeClusterDimension;
-            attr.val.clusterDim = {kNumTMAMulticast, 1, 1};
-            config.attrs = &attr;
-            config.numAttrs = 1;
-
-            int clusters = 0;
-            config.gridDim = 8;
-            attr.val.clusterDim = {8, 1, 1};
-            cudaOccupancyMaxActiveClusters(&clusters, kernel, &config);
-
-            static cudaStream_t stream1 = nullptr, stream2 = nullptr;
-            static cudaEvent_t event1 = nullptr, event2 = nullptr;
-            if (stream1 == nullptr) {
-                // this will leak, assuming it's OK/negligible for now
-                // (CUDA has no real limit but reuses HW resources which may lead to false dependencies)
-                cudaStreamCreate(&stream1);
-                cudaStreamCreate(&stream2);
-                cudaEventCreate(&event1);
-                cudaEventCreate(&event2);
-            }
-
-            // make stream1 and stream2 dependent on stream
-            cudaEventRecord(event1, stream);
-            cudaStreamWaitEvent(stream1, event1, 0);
-            cudaStreamWaitEvent(stream2, event1, 0);
-
-            config.gridDim = clusters * 8;
-            config.stream = stream1;
-            auto status1 = cudaLaunchKernelEx(&config, kernel,
-                                             gmem_d, gmem_b, scales_b, grouped_layout, zeroed_scratch, shape_m,
-                                             tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc, tma_d_padded_desc,
-                                             0, num_sms, large_params);
-            DG_HOST_ASSERT( status1 == cudaSuccess);
-
-            // use the remaining SMs with a cluster size of 2 threadgroups
-            config.gridDim = num_sms - (clusters * 8);
-            attr.val.clusterDim = {2, 1, 1};
-            config.stream = stream2;
-            auto status2 = cudaLaunchKernelEx(&config, kernel,
-                                            gmem_d, gmem_b, scales_b, grouped_layout, zeroed_scratch, shape_m,
-                                            tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc, tma_d_padded_desc,
-                                            clusters * 8, num_sms, large_params);
-            DG_HOST_ASSERT( status2 == cudaSuccess);
-
-            // make stream dependent on stream1 and stream2
-            cudaEventRecord(event1, stream1);
-            cudaEventRecord(event2, stream2);
-            cudaStreamWaitEvent(stream, event1, 0);
-            cudaStreamWaitEvent(stream, event2, 0);
-        } else {
+        } /*else if ((SHAPE_N % (BLOCK_N * 8)) == 0) {
+            // TODO: Add back support for Hybrid Cluster Size with L2 side optimization
+            // [...] see older commits [...]
+        }*/ else {
             cudaLaunchAttribute attr;
             attr.id = cudaLaunchAttributeClusterDimension;
             attr.val.clusterDim = {1, 1, 1};
             config.attrs = &attr;
             config.numAttrs = 1;
 
-            // TODO: need to add support for hybrid cluster sizes with reserved SMs but it's tricky
-            // if num_sms < SMs and another kernel is using the reserved SMs, we might have a problem:
-            // if the other kernel is scheduled first, AFAIK there's no guarantee the *right SM* are still available!
-            // ==> one solution might be to issue extra clusters of 2 and dynamically get a block idx using atomicAdd
-            // so if the large clusters haven't launched after nanosleep(ns), they start execution, otherwise they exit?
-            // but also(/rather) provide a way to make sure the other kernels use SMs we don't need to avoid this issue
             config.gridDim = num_sms;
             attr.val.clusterDim = {kNumTMAMulticast, 1, 1};
             config.stream = stream;
             auto status = cudaLaunchKernelEx(&config, kernel,
                                             gmem_d, gmem_b, scales_b, grouped_layout, zeroed_scratch, shape_m,
                                             tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc, tma_d_padded_desc,
-                                            0, num_sms, large_params);
+                                            0, num_sms, param_sideaware);
             DG_HOST_ASSERT(status == cudaSuccess);
         }
     }

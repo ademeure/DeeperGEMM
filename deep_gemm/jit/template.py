@@ -13,13 +13,14 @@ typename_map: Dict[Any, str] = {
     torch.float: 'torch.float',
     torch.bfloat16: 'torch.bfloat16',
     torch.float8_e4m3fn: 'torch.float8_e4m3fn',
+    torch.uint8: 'torch.uint8',
     torch.cuda.Stream: 'torch.cuda.Stream',
 }
 
 # `ctype` map for Python casting
 ctype_map: Dict[Any, Any] = {
     **{t: getattr(ctypes, f'c_{t.__name__}') for t in (bool, int, float)},
-    **{t: ctypes.c_void_p for t in (torch.int, torch.float, torch.bfloat16, torch.float8_e4m3fn, torch.cuda.Stream)},
+    **{t: ctypes.c_void_p for t in (torch.int, torch.float, torch.bfloat16, torch.float8_e4m3fn, torch.cuda.Stream, torch.uint8)},
 }
 
 
@@ -32,6 +33,7 @@ genc_map = {
     torch.float: ('void*', 'float*'),
     torch.bfloat16: ('void*', '__nv_bfloat16*'),
     torch.float8_e4m3fn: ('void*', '__nv_fp8_e4m3*'),
+    torch.uint8: ('void*', 'unsigned char*'),
     torch.cuda.Stream: ('void*', 'cudaStream_t'),
 }
 

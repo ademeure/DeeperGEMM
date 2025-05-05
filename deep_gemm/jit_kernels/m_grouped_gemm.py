@@ -4,6 +4,7 @@ from typing import Tuple
 from .gemm import get_best_configs
 from .tuner import jit_tuner
 from .utils import get_col_major_tma_aligned_tensor, get_num_sms
+from .sideaware import sideaware_torch_side_index, sideaware_info, sideaware_enabled
 
 # C++ code templates
 includes = ('"deep_gemm/fp8_gemm.cuh"', )
@@ -17,9 +18,11 @@ constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumUnroll = {NUM_UNROLL};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
+constexpr auto kL2HashBits = {L2_HASH_BITS};
+constexpr auto kL2Optimization = {L2_OPTIMIZATION};
 
 // Make a templated grouped GEMM
-using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, {NUM_GROUPS}, kNumStages, kNumUnroll, kNumTMAMulticast, GemmType::{GEMM_TYPE}>;
+using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, {NUM_GROUPS}, kNumStages, kNumUnroll, kNumTMAMulticast, GemmType::{GEMM_TYPE}, kL2HashBits, kL2Optimization>;
 
 // Launch kernel
 auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
@@ -30,7 +33,7 @@ auto tma_d_padded_desc = GemmType::make_3d_tma_d_desc(out, m);
 GemmType::run(out, rhs, rhs_scales, grouped_layout,
               m,
               tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc, tma_d_padded_desc,
-              stream, num_sms, smem_size);
+              stream, num_sms, smem_size, side_index);
 """
 
 
@@ -91,18 +94,19 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
                                                                                   is_grouped_contiguous=True)
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m, num_groups,
-            torch.cuda.current_stream(), num_sms, smem_size)
+            torch.cuda.current_stream(), num_sms, smem_size, sideaware_torch_side_index())
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedContiguous'},
+              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedContiguous',
+              'L2_HASH_BITS': sideaware_info()["hash"], 'L2_OPTIMIZATION': sideaware_enabled()},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
                   ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int), ('num_groups', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int), ('side_index', torch.uint8)),
         template=template,
         args=args
     )
@@ -169,18 +173,19 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, m,
-            torch.cuda.current_stream(), num_sms, smem_size)
+            torch.cuda.current_stream(), num_sms, smem_size, sideaware_torch_side_index())
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedMasked'},
+              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedMasked',
+              'L2_HASH_BITS': sideaware_info()["hash"], 'L2_OPTIMIZATION': sideaware_enabled()},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
                   ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('m', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int), ('side_index', torch.uint8)),
         template=template,
         args=args
     )

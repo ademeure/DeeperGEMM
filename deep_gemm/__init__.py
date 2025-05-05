@@ -10,6 +10,9 @@ from .jit_kernels import (
     ceil_div,
     set_num_sms, get_num_sms,
     get_col_major_tma_aligned_tensor,
-    get_m_alignment_for_contiguous_layout
+    get_m_alignment_for_contiguous_layout,
+    sideaware_init, sideaware_enabled, sideaware_compile,
+    sideaware_torch_side_index, sideaware_gpu_side_index, sideaware_cpu_side_index,
+    sideaware_info, sideaware_info_raw,
 )
 from .utils import bench, bench_kineto, calc_diff
