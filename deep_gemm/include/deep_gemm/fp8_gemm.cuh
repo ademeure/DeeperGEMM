@@ -27,6 +27,18 @@ constexpr int PADDING_N = 16; // padding for D to avoid STSM bank conflicts (tod
 constexpr int NUM_TILES_INITIAL = 32; // calxulate m/n for INITIAL tiles in parallel in prologue
 constexpr int NUM_TILES_STORAGE = 64; // 1 more every time we load B scales in a round-robin buffer
 
+// Register reconfigurations (24/208 is OK for most shapes but slower for 4096 x 24576 x 1536 on CUDA 12.8?)
+constexpr int kNumTMARegisters = 32;
+constexpr int kNumMathRegisters = 224;
+
+// Highly situational, when we flush L2 by writing new data (current default) rather than reading existing data,
+// we can get >10% for M=64/128, but that seems unrealistic (same reason why L2 opt might help less in production)
+#define POLICY_TINY_A_READ_B  "createpolicy.fractional.L2::evict_first.L2::evict_unchanged.b64 policy, 1.0;\n"
+#define POLICY_TINY_A_WRITE_D "createpolicy.fractional.L2::evict_unchanged.L2::evict_unchanged.b64 policy, 1.0;\n"
+
+#define POLICY_BIG_A_READ_B   "createpolicy.fractional.L2::evict_unchanged.L2::evict_unchanged.b64 policy, 1.0;\n"
+#define POLICY_BIG_A_WRITE_D  "createpolicy.fractional.L2::evict_first.L2::evict_unchanged.b64 policy, 1.0;\n"
+
 enum class Layout {
     RowMajor,
     ColMajor
@@ -211,11 +223,6 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
         (kTMAMulticastEnabled) ? cutlass::arch::fence_barrier_init() : void();
     }
 
-    // Register reconfigurations
-    // TODO - this was to allow 256 'TMA' threads, but no apparent benefit from more registers than this anyway
-    constexpr int kNumTMARegisters = 32;
-    constexpr int kNumMathRegisters = 224;
-
     // Synchronize all threads to make barrier visible in normal memory model (as late as possible)
     (kTMAMulticastEnabled) ? cute::cluster_sync() : __syncthreads();
 
@@ -328,6 +335,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                             // optimized PTX version of next_stage()
                             // this was required because we had multiple warps interleaving iterations of the loop
                             // not sure if this is actually faster than the baseline version with a single warp or not
+                            // but it's here now, so enjoy I guess?
                             asm volatile(
                                 "{\n"
                                 "    .reg .pred p;\n"
@@ -342,7 +350,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                             );
 
                             if (num_bytes > 0) {
-                                // Check sideaware_kernel.cuh for a simpler version of the side aware algorithm without PTX
+                                // Check sideaware_kernel.cuh for a saner version of the side aware algorithm without PTX
                                 //
                                 // Determine the desired side based on the l2_hash_bits of the address (using popc)
                                 // then use this to adjust the offset as required (see sideaware_kernel.cuh)
@@ -372,7 +380,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                                     // Fast path with a single thread active per warp
                                     asm volatile(
                                         "    mov.b64 address, {%0, %1};\n"
-                                        "    cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%2], [address], %3, [%4];\n"
+                                        "    cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%2], [address], %3, [%4], policy;\n"
                                         "    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%4], %5; \n"
                                         "}\n"
                                         : : "r"(gmem_address_u32[0]), "r"(gmem_address_u32[1]),
@@ -387,7 +395,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                                         "    .reg .pred p;\n"
                                         "    setp.eq.u32 p, %6, 0;\n"
                                         "    mov.b64 address, {%0, %1};\n"
-                                        "    cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%2], [address], %3, [%4];\n"
+                                        "    cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%2], [address], %3, [%4], policy;\n"
                                         "@p  mbarrier.arrive.expect_tx.shared::cta.b64 _, [%4], %5; \n"
                                         "}\n"
                                         : : "r"(gmem_address_u32[0]), "r"(gmem_address_u32[1]),
@@ -399,6 +407,15 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                             }
                         }
                     };
+
+                    // Weird perf issues I didn't understand creating the policy in the loop, so gave up and put it here
+                    // A sane person would use a variable rather than PTX scope via {}, but I never claimed to be sane.
+                    asm volatile("{\n .reg .b64 policy;\n"
+                                    " .reg .pred p;\n"
+                                    " setp.eq.u32 p, %0, %1;\n"
+                                    " @p " POLICY_TINY_A_READ_B
+                                    " @!p " POLICY_BIG_A_READ_B
+                                    : : "r"(shape_m), "r"(BLOCK_M) : "memory");
 
                     if (!aligned_n && remaining_n < BLOCK_N) {
                         // Slow path with dynamic num_byte
@@ -414,6 +431,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                         num_bytes = CHUNK_SIZE * BLOCK_K;
                         load_b_for_every_k();
                     }
+                    asm volatile("}\n" : : ); // end 'policy' variable scope
                 }
             } else {
                 // Legacy approach without L2 side optimization
@@ -573,7 +591,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
             // Write final_accum to shared memory using STSM
             // Padded to avoid up to 8x(!) shared memory bank conflicts
             auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_a_base + tile_s * (SMEM_AB_SIZE_PER_STAGE));
-            bool partially_oob = (old_n_block_idx * BLOCK_N) > (SHAPE_N - BLOCK_N);
+            bool partially_oob = (old_n_block_idx * BLOCK_N) > (SHAPE_N - BLOCK_N) && (SHAPE_N % BLOCK_N) > 0;
             uint32_t BLOCK_N_STORE = partially_oob ? BLOCK_N : BLOCK_N_PADDED;
 
             // Only process part of the tile at a time if possible
@@ -608,31 +626,25 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, __nv_fp8_e4m3* gmem_b, float* scales_b, i
                 // Use TMA store to write back to global memory (per warpgroup rather than per threadgroup)
                 // using threads which aren't part of a subprocessor that's active in the producer warpgroup
                 if ((threadIdx.x == 96 || threadIdx.x == 224)) {
-                    // TODO: evict_first is optimal when benchmarking the kernel individually
-                    // but we might still want a way to disable it when the next kernel could realistically hit in the L2?
-                    if (partially_oob) {
-                        uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(&tensor_map_d);
-                        uint32_t smem_int_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_d + (math_wg_idx * BLOCK_N * 64)));
-                        asm volatile (
-                            "{\n"
-                                ".reg .b64 policy;\n"
-                                "createpolicy.fractional.L2::evict_first.b64 policy, 1.0;\n"
-                                "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint [%0, {%2, %3}], [%1], policy;\n"
-                            "}\n"
-                            :: "l"(gmem_int_desc), "r"(smem_int_ptr),
-                            "r"(old_n_block_idx * BLOCK_N), "r"(old_global_idx + (math_wg_idx * 64)) : "memory");
-                    } else {
-                        uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(&tensor_map_d_padded);
-                        uint32_t smem_int_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_d + (math_wg_idx * BLOCK_N_STORE * 64)));
-                        asm volatile (
-                            "{\n"
-                                ".reg .b64 policy;\n"
-                                "createpolicy.fractional.L2::evict_first.b64 policy, 1.0;\n"
-                                "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint [%0, {%2, %3, %4}], [%1], policy;\n"
-                            "}\n"
-                            :: "l"(gmem_int_desc), "r"(smem_int_ptr),
-                            "n"(0), "r"(old_n_block_idx), "r"(old_global_idx + (math_wg_idx * 64)) : "memory");
-                    }
+                    uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(partially_oob ? &tensor_map_d : &tensor_map_d_padded);
+                    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_d + (math_wg_idx * BLOCK_N_STORE * 64)));
+
+                    // A sane person wouldn't use PTX here, but we're well past that point by now
+                    asm volatile("{\n .reg .b64 policy;\n"
+                                 "    .reg .pred p;\n"
+                                 "    setp.eq.u32 p, %0, %1;\n"
+                                 "    @p  " POLICY_TINY_A_WRITE_D
+                                 "    @!p " POLICY_BIG_A_WRITE_D
+                                 "    setp.eq.u32 p, %2, 1;\n"
+                                 "    @p  cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint [%3, {%5, %6}], [%4], policy;\n"
+                                 "    @!p cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint [%3, {0, %7, %6}], [%4], policy;\n"
+                                 "}\n"
+                                    : : "r"(shape_m) /*0*/, "r"(BLOCK_M) /*1*/, "r"((uint32_t)partially_oob) /*2*/,
+                                        "l"(gmem_int_desc) /*3*/, "r"(smem_int_ptr) /* 4 */,
+                                        "r"(old_n_block_idx * BLOCK_N)              /* 5 (2D only)*/,
+                                        "r"(old_global_idx + (math_wg_idx * 64))    /* 6 (2D/3D)*/,
+                                        "r"(old_n_block_idx)                        /* 7 (3D only)*/
+                                        : "memory");
 
                     cute::tma_store_arrive();
                     cute::tma_store_wait<0>();
