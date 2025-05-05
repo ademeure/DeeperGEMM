@@ -72,7 +72,7 @@ def parse_registers(line):
     return registers
 
 
-def modify_segment(m, name, ffma_lines):
+def modify_segment(yield_every_n, m, name, ffma_lines):
     num_lines = len(ffma_lines)
     assert num_lines % 2 == 0
 
@@ -81,20 +81,26 @@ def modify_segment(m, name, ffma_lines):
     dst_reg_set = set()
     last_reused, last_dst_reg = False, ''
     num_changed = 0
+    ffma_since_yield = 0
     for i in range(num_lines // 2):
         dst_reg = parse_registers(ffma_lines[i * 2])[-2]
         low_line, high_line = ffma_lines[i * 2], ffma_lines[i * 2 + 1]
         low_hex, high_hex = extract_hex_from_line(low_line), extract_hex_from_line(high_line)
         le_bytes.append(low_hex.to_bytes(8, 'little') + high_hex.to_bytes(8, 'little'))
         reused = (high_hex & 0x0800000000000000) != 0
+
+        yielding = (high_hex & 0x0800200000000000) == 0
+        ffma_since_yield = (not yielding) and ffma_since_yield + 1 or 0
+
         if reused:
             is_first_occurred = dst_reg not in dst_reg_set
-            if is_first_occurred or (last_reused and dst_reg == last_dst_reg):
+            if (is_first_occurred or (last_reused and dst_reg == last_dst_reg)) and ffma_since_yield >= yield_every_n:
                 # Modify the `reuse` and `yield` bits
                 assert high_hex & 0x0800200000000000, f'{hex(high_hex)}'
                 high_hex ^= 0x0800200000000000
                 reused = False
                 num_changed += 1
+                ffma_since_yield = 0
             else:
                 reused_list.append(i)
         dst_reg_set.add(dst_reg)
@@ -102,7 +108,6 @@ def modify_segment(m, name, ffma_lines):
         last_reused, last_dst_reg = reused, dst_reg
     if os.getenv('DG_PRINT_REG_REUSE', None):
         print(f' > segment `{name}` new reused list ({num_changed} changed): {reused_list}')
-
     # Find the offset
     offsets = []
     offset = m.find(le_bytes[0])
@@ -118,6 +123,12 @@ def modify_segment(m, name, ffma_lines):
 
 
 def process(path):
+    # New default of 1 reuse every 4 FFMAs (previously 1 every 2 FFMAs)
+    # DeeperGEMM is less latency sensitive than the original :)
+    # So it's less important to prioritize the producer warps by yielding in the consumers
+    # Increasing the amount of reuse will very slightly improve power efficiency, it's a trade-off
+    # (in reality, this makes ~zero difference, but the previous default bothered me intellectually)
+    yield_every_n = os.getenv('DG_FFMA_YIELD_EVERY_N_INSTRUCTIONS', 4)
     if os.getenv('DG_PRINT_REG_REUSE', None):
         print(f'Processing {path}')
     output = run_cuobjdump(path)
@@ -125,7 +136,7 @@ def process(path):
     with open(path, 'r+b') as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE)
         for segment in segments:
-            modify_segment(mm, *segment)
+            modify_segment(yield_every_n, mm, *segment)
         mm.close()
 
 
